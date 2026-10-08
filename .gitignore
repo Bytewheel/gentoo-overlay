@@ -1,0 +1,4 @@
+# distro-agnostic build workdir (rozelynx-distro-build.sh output)
+/scripts/firefox-librewolf/rozelynx-distro-build/
+*.bak
+__pycache__/

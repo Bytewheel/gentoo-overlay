@@ -1,0 +1,2 @@
+https://github.com/gentoo/gentoo.git www-client/firefox
+post-sync: scripts/firefox-librewolf/apply.sh

@@ -1,0 +1,10 @@
+# Belt and braces, not the mechanism.
+#
+# The real fix is that nothing is generated IN the tree any more: netiface/run.sh
+# extracts and compiles into a scratch directory, and branding/run.sh extracts
+# into one too. These entries cover the case where extract.py is run on its own,
+# which is a legitimate thing to do when debugging an extraction.
+netiface/extracted_types.inc
+netiface/extracted_impl.inc
+netiface/harness
+netiface/harness.build.log

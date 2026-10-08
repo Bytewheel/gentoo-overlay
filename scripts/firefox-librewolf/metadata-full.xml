@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+<maintainer type="project">
+	<email>mozilla@gentoo.org</email>
+	<name>Gentoo Mozilla Team</name>
+</maintainer>
+<use>
+	<flag name="clang">Use Clang compiler instead of GCC</flag>
+	<flag name="eme-free">Disable EME (DRM plugin) capability at build time</flag>
+	<flag name="gmp-autoupdate">Allow Gecko Media Plugins (binary blobs) to be automatically downloaded and kept up-to-date in user profiles</flag>
+	<flag name="gnome-shell">Integrate with gnome-base/gnome-shell search</flag>
+	<flag name="hwaccel">Force-enable hardware-accelerated rendering (Mozilla bug 594876)</flag>
+	<flag name="jpegxl">Add JPEG XL image support (EXPERIMENTAL, no official upstream support)</flag>
+	<flag name="jumbo-build">Enable unified build - combines source files to speed up build process, but requires more memory</flag>
+	<flag name="libproxy">Enable libproxy support</flag>
+	<flag name="openh264">Use media-libs/openh264 for H264 support instead of downloading binary blob from Mozilla at runtime</flag>
+	<flag name="pgo">Add support for profile-guided optimization for faster binaries - this option will double the compile time</flag>
+	<flag name="pulseaudio">Add sound server support via media-libs/libpulse (may be PulseAudio or Pipewire, or apulse if installed)</flag>
+	<flag name="sndio">Enable support for the media-sound/sndio backend</flag>
+	<flag name="system-av1">Use the system-wide media-libs/dav1d and media-libs/libaom library instead of bundled</flag>
+	<flag name="system-harfbuzz">Use the system-wide media-libs/harfbuzz instead of bundled and media-gfx/graphite2 in most cases</flag>
+	<flag name="system-icu">Use the system-wide dev-libs/icu instead of bundled</flag>
+	<flag name="system-jpeg">Use the system-wide media-libs/libjpeg-turbo instead of bundled</flag>
+	<flag name="system-libevent">Use the system-wide dev-libs/libevent instead of bundled</flag>
+	<flag name="system-libvpx">Use the system-wide media-libs/libvpx instead of bundled</flag>
+	<flag name="system-pipewire">Use system media-video/pipewire for WebRTC and screencast instead of bundled one</flag>
+	<flag name="system-png">Use the system-wide media-libs/libpng instead of bundled (requires APNG patches)</flag>
+	<flag name="system-webp">Use the system-wide media-libs/libwebp instead of bundled</flag>
+	<flag name="wasm-sandbox">Sandbox certain third-party libraries through WebAssembly using RLBox</flag>
+	<flag name="wifi">Enable necko-wifi for NetworkManager integration, and access point MAC address scanning for better precision with opt-in geolocation services</flag>
+
+	<!-- LibreWolf-style privacy hardening USE flags -->
+	<flag name="remove-safebrowsing">Disable Google Safe Browsing (patches: stop-undesired-requests.patch)</flag>
+	<flag name="remove-pocket">Remove Pocket integration (policies.json + prefs)</flag>
+	<flag name="remove-password-manager">Remove built-in password manager (patches: hide-passwordmgr.patch)</flag>
+	<flag name="remove-sponsored">Remove sponsored content, Firefox Suggest, ad tiles, shopping, AI data (prefs)</flag>
+	<flag name="librewolf-ui">Add LibreWolf custom settings pane (patches: pref-pane-small.patch)</flag>
+	<flag name="extension-firewall">Enable extension CSP firewall + RemoteSettings filtering (patches: rs-blocker.patch)</flag>
+	<flag name="remove-pingsender">Remove pingsender binary that sends telemetry pings (patch: remove-pingsender.patch)</flag>
+	<flag name="remove-openai">Remove OpenAI/ML integration from Firefox (patch: remove-openai.patch)</flag>
+	<flag name="webgl-permission">Change WebGL to per-site permission prompt (patch: webgl-permission.patch)</flag>
+	<flag name="fingerprint-fixes">Fix canvas fingerprint protection behavior (patches: fpp-canvas-fix.patch, fix-canvas-extraction-permission.patch)</flag>
+	<flag name="autoconfig-enhanced">Enhance autoconfig with setEnv + profile overrides (patches: autoconfig-setEnv.patch, profile-directory.patch)</flag>
+	<flag name="remove-ads">Remove CFR popups and sponsored urlbar interventions (patches: remove-cfrprefs.patch, urlbarprovider-interventions.patch)</flag>
+	<flag name="privacy-ui">Privacy UI enhancements for about:preferences (patches: privacy-preferences.patch, hide-default-browser.patch, etc)</flag>
+	<flag name="translation-fullpage">Enable full-page translation support (patches: fullpage-translations.patch, fullpage-translations-customization.patch)</flag>
+	<flag name="extension-uninstall-url">Clear extension uninstall URL for privacy (patch: extensions-setUninstallURL.patch)</flag>
+	<flag name="permission-tweaks">Adjust permission defaults for privacy (patches: lw-permissions.patch, allow_cookies_for_site.patch, limit-access.patch)</flag>
+	<flag name="ui-tweaks">Miscellaneous UI patches (patches: firefox-view.patch, handlers.patch, neterror.patch, etc)</flag>
+	<flag name="link-preview">Modify link preview feature (patch: link-preview.patch)</flag>
+	<flag name="language-packs">Adjust language pack handling (patches: languages.patch, remove-language-packs.patch)</flag>
+	<flag name="xdg-profile">Use XDG base directories for profile storage (patch: xdg-dir.patch)</flag>
+	<flag name="newtab-fixes">Fix newtab page with privacy features (patch: newtab-fix.patch)</flag>
+
+	<!-- RozeLynx feature USE flags -->
+	<flag name="rozelynx">Master flag: enables moz.configure changes, RozeLynx branding, and feature extension platform (app name: RozeLynx, vendor: ByteWheel)</flag>
+	<flag name="rozelynx-debug">Apply dev protocol debug patches: CDP, Marionette, RemoteAgent, WebDriverBiDi (requires rozelynx)</flag>
+	<flag name="chrome-web-store">Enable Chrome Web Store extension installation support via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="experiments">Enable A/B testing and feature flag system via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="external-browser">Add "Open in other browser" context menu items via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="i18n">Enable internationalization utilities and language pack management (requires rozelynx)</flag>
+	<flag name="mouse-gestures">Enable mouse gesture navigation (RMB + draw shapes) via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="qr-code">Enable QR code generator toolbar button via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="pwa">Enable Progressive Web App support - installs C++ Linux taskbar integration + JS PWA module (requires rozelynx, gtk)</flag>
+	<flag name="lepton-skin">Bundle the compact Lepton UI theme CSS via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="ip-protection">Enable IP protection privacy UI overrides via RozeLynx Features extension (requires rozelynx)</flag>
+ 	<flag name="net-iface">Pin network traffic to specific interfaces via SO_BINDTODEVICE; grants CAP_NET_RAW to rozelynx binary (requires rozelynx)</flag>
+ </use>
+</pkgmetadata>

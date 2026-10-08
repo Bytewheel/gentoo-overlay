@@ -1,0 +1,13 @@
+	<flag name="rozelynx">Master flag: enables moz.configure changes, RozeLynx branding, and feature extension platform (app name: RozeLynx, vendor: ByteWheel)</flag>
+	<flag name="rozelynx-debug">Apply dev protocol debug patches: CDP, Marionette, RemoteAgent, WebDriverBiDi (requires rozelynx)</flag>
+	<flag name="chrome-web-store">Enable Chrome Web Store extension installation support via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="experiments">Enable A/B testing and feature flag system via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="external-browser">Add "Open in other browser" context menu items via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="i18n">Enable internationalization utilities and language pack management (requires rozelynx)</flag>
+	<flag name="mouse-gestures">Enable mouse gesture navigation (RMB + draw shapes) via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="qr-code">Enable QR code generator toolbar button via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="pwa">Enable Progressive Web App support - installs C++ Linux taskbar integration + JS PWA module (requires rozelynx, gtk)</flag>
+	<flag name="lepton-skin">Bundle the compact Lepton UI theme CSS via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="ip-protection">Enable IP protection privacy UI overrides via RozeLynx Features extension (requires rozelynx)</flag>
+	<flag name="download-handoff">Hand downloads off to a configured download manager before the browser prompts. Manager-agnostic: any extension that answers a download message, any program on PATH, or the built-in uGet integrator (requires rozelynx)</flag>
+	<flag name="net-iface">Pin network traffic to specific interfaces via SO_BINDTODEVICE; grants CAP_NET_RAW to rozelynx binary (requires rozelynx)</flag>
