@@ -2122,8 +2122,37 @@ EOF
 
         mkdir -p "${STAGE}${PREFIX}/share/icons/hicolor/scalable/apps" \
                  "${STAGE}${PREFIX}/share/icons/hicolor/symbolic/apps"
-        cp "${SRC_ROOT}/rozelynx/icon/rozelynx.svg" \
-           "${STAGE}${PREFIX}/share/icons/hicolor/scalable/apps/rozelynx.svg"
+        # The scalable theme icon (hicolor scalable/apps/rozelynx.svg) is what
+        # the Icon=rozelynx theme name resolves to - the .desktop's own icon,
+        # the notification badge fallback, and the PWA module's last-resort
+        # Icon= for a site whose own icon could not be materialised. Copying
+        # icon/rozelynx.svg (the old rose vector) there put the discontinued
+        # logo on every one of those surfaces, which is exactly the mismatch
+        # the PWA ladder exists to hide. So the scalable slot is GENERATED
+        # from branding/paw.png (the same mark the PNG ladder carries),
+        # base64-embedded the same way defaultFavicon.svg embeds favicon64:
+        # no committed base64 blob, re-droppable at any resolution, and the
+        # theme name and the PNG ladder can no longer disagree. icon/rozelynx
+        # .svg stays what the in-chrome rebranding sweep copies (a separate,
+        # still-open vector gap).
+        local theme_png="${SRC_ROOT}/rozelynx/branding/paw.png"
+        if [[ -f "${theme_png}" && -n "$(command -v base64)" ]]; then
+            local theme_b64
+            theme_b64="$(base64 -w0 "${theme_png}")"
+            cat > "${STAGE}${PREFIX}/share/icons/hicolor/scalable/apps/rozelynx.svg" <<ROZELYNX_THEME_ICON || die "failed to write the scalable theme icon"
+<!-- RozeLynx: branding/paw.png embedded as the hicolor scalable theme icon.
+     The PNG ladder under hicolor/<n>x<n>/apps/rozelynx.png carries the same
+     artwork, so every Icon=rozelynx consumer and every size agree. -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="474" height="474" viewBox="0 0 474 474">
+  <image x="0" y="0" width="474" height="474" preserveAspectRatio="xMidYMid meet" xlink:href="data:image/png;base64,${theme_b64}"/>
+</svg>
+ROZELYNX_THEME_ICON
+            log "    scalable theme icon: branding/paw.png -> scalable/apps/rozelynx.svg (replaces the old rose vector)"
+        else
+            warn "branding/paw.png absent; the scalable theme icon stays the old rose vector"
+            cp "${SRC_ROOT}/rozelynx/icon/rozelynx.svg" \
+               "${STAGE}${PREFIX}/share/icons/hicolor/scalable/apps/rozelynx.svg"
+        fi
         cp "${SRC_ROOT}/rozelynx/icon/rozelynx-symbolic.svg" \
            "${STAGE}${PREFIX}/share/icons/hicolor/symbolic/apps/rozelynx-symbolic.svg"
         # the org.bytewheel.* alias the appimage flow re-uses
