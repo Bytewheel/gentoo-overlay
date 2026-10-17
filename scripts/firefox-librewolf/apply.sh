@@ -29,7 +29,7 @@ backup_dir="$target_path/scripts/firefox-librewolf"
 template="$backup_dir/firefox-template.ebuild"
 firefox_files="$pkg_dir/files"
 
-patched_marker='RozeLynx Web Browser|with LibreWolf-style privacy hardening'
+patched_marker='LibreWolf-style privacy hardening'
 
 echo "  -> Restoring LibreWolf patches..."
 rm -rf "$firefox_files/librewolf"

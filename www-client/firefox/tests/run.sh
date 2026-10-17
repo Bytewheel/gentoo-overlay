@@ -42,6 +42,7 @@ HARNESSES=(
 	"mouse-gestures-menu"
 	"downloads-handoff-module"
 	"downloads-handoff-editor"
+	"downloads-handoff-content"
 	"rozelynx-windows-api"
 	"pwa-launcher-entries"
 	"security-canvas"

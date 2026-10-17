@@ -65,6 +65,7 @@
 	<flag name="pwa">Enable Progressive Web App support - installs C++ Linux taskbar integration + JS PWA module (requires rozelynx, gtk)</flag>
 	<flag name="lepton-skin">Bundle the compact Lepton UI theme CSS via RozeLynx Features extension (requires rozelynx)</flag>
 	<flag name="ip-protection">Enable IP protection privacy UI overrides via RozeLynx Features extension (requires rozelynx)</flag>
+ 	<flag name="download-handoff">Hand downloads off to a configured download manager before the browser prompts. Manager-agnostic: any extension that answers a download message, any program on PATH, or the built-in uGet integrator (requires rozelynx)</flag>
  	<flag name="net-iface">Pin network traffic to specific interfaces via SO_BINDTODEVICE; grants CAP_NET_RAW to rozelynx binary (requires rozelynx)</flag>
  </use>
 </pkgmetadata>

@@ -27,6 +27,7 @@
 #   prepare   - unpack firefox, apply Gentoo patchset, the full RozeLynx
 #               sequence (configure patch, branding sweep + branding dir +
 #               magick icon generation, PWA + net-iface C++ components,
+#               the PAM passkey platform authenticator, the
 #               extension-menus patch) and the LibreWolf privacy patch set,
 #               feature-gated with the same flag names as the ebuild USE
 #               flags
@@ -66,6 +67,12 @@
 #   * The Gentoo patchset is applied because the mozconfig mirrors the
 #     ebuild defaults (system libs everywhere); drop --no-use system-* if
 #     you want fewer system-library dependencies.
+#   * pam-passkeys links libpam into libxul (sys-libs/pam on Gentoo, pam on
+#     Arch, libpam0g-dev on Debian) and needs a PAM service to verify
+#     against: /etc/pam.d/rozelynx if present, else the system-auth /
+#     common-auth chains (face recognition via howdy, password fallback).
+#     Without a PAM stack the feature reports unavailable and WebAuthn
+#     falls back to USB security keys.
 #   * net-iface SO_BINDTODEVICE needs CAP_NET_RAW: granted via setcap in
 #     the staged tree when running as root (xattrs survive tar + snap
 #     pack). AppImage squashfs mounts are nosuid - grant cap_net_raw to
@@ -82,6 +89,7 @@ VERSIONS_CONF="${SELF_DIR}/rozelynx-distro-versions.conf"
 # pinned-source defaults (rozelynx-distro-versions.conf), env overrides win
 # ---------------------------------------------------------------------------
 FIREFOX_VERSION=""
+APP_VERSION=""
 GENTOO_PATCHSET=""
 GENTOO_PATCHSET_BASE_URI=""
 FIREFOX_SOURCE_SHA512=""
@@ -101,6 +109,7 @@ if [[ -r ${VERSIONS_CONF} ]]; then
     source "${VERSIONS_CONF}"
 fi
 [[ -n ${ROZELYNX_FIREFOX_VERSION:-} ]] && FIREFOX_VERSION="${ROZELYNX_FIREFOX_VERSION}"
+[[ -n ${ROZELYNX_APP_VERSION:-} ]] && APP_VERSION="${ROZELYNX_APP_VERSION}"
 [[ -n ${ROZELYNX_LIBREWOLF_REF:-} ]] && LIBREWOLF_REF="${ROZELYNX_LIBREWOLF_REF}"
 [[ -n ${ROZELYNX_FLOORP_REF:-} ]] && FLOORP_REF="${ROZELYNX_FLOORP_REF}"
 
@@ -121,12 +130,12 @@ ALL_FLAGS=(
     ui-tweaks link-preview language-packs xdg-profile newtab-fixes
     rozelynx rozelynx-debug chrome-web-store experiments external-browser
     i18n mouse-gestures qr-code pwa lepton-skin ip-protection net-iface
-    download-handoff
+    download-handoff pam-passkeys
 )
 DEFAULT_USE_ON=(
     rozelynx chrome-web-store experiments external-browser i18n mouse-gestures
     qr-code pwa lepton-skin ip-protection net-iface download-handoff
-    remove-safebrowsing remove-pocket remove-password-manager remove-sponsored
+    pam-passkeys remove-safebrowsing remove-pocket remove-password-manager remove-sponsored
     librewolf-ui extension-firewall remove-pingsender remove-openai
     webgl-permission fingerprint-fixes autoconfig-enhanced remove-ads
     privacy-ui translation-fullpage extension-uninstall-url permission-tweaks
@@ -245,7 +254,8 @@ while [[ $# -gt 0 ]]; do
         --jobs|-j)  JOBS="${2:?}"; shift ;;
         --prefix)   PREFIX="${2:?}"; shift ;;
         --libdir)   LIBDIR="${2:?}"; shift ;;
-        --firefox)  FIREFOX_VERSION="${2:?}"; shift ;;
+        --firefox)      FIREFOX_VERSION="${2:?}"; shift ;;
+        --app-version)  APP_VERSION="${2:?}"; shift ;;
         --librewolf-ref) LIBREWOLF_REF="${2:?}"; shift ;;
         --floorp-ref)    FLOORP_REF="${2:?}"; shift ;;
         --use|--no-use)
@@ -279,7 +289,8 @@ fi
 if ! use rozelynx; then
     _off=()
     for _f in chrome-web-store experiments external-browser i18n mouse-gestures \
-              qr-code pwa lepton-skin ip-protection net-iface download-handoff; do
+              qr-code pwa lepton-skin ip-protection net-iface download-handoff \
+              pam-passkeys; do
         use "${_f}" && { USE["${_f}"]=0; _off+=("${_f}"); }
     done
     unset _f
@@ -332,6 +343,11 @@ unset _cand
 GNU_TRIPLET="${ARCH}-unknown-linux-gnu"
 
 [[ -n ${FIREFOX_VERSION} ]] || die "FIREFOX_VERSION not set (edit ${VERSIONS_CONF} or pass --firefox VER)"
+# The release version the browser reports and the artifacts are named
+# with. Defaults to the Firefox base (plain upstream-aligned builds);
+# rozelynx-only point releases bump it via rozelynx-distro-versions.conf
+# (APP_VERSION) while the source pin above stays at the Firefox version.
+APP_VERSION="${APP_VERSION:-${FIREFOX_VERSION}}"
 MOZ_P="firefox-${FIREFOX_VERSION}"
 FIREFOX_SRC_TARBALL="${MOZ_P}.source.tar.xz"
 FIREFOX_SRC_URI="https://archive.mozilla.org/pub/firefox/releases/${FIREFOX_VERSION}/source/${FIREFOX_SRC_TARBALL}"
@@ -490,6 +506,14 @@ stage_prepare() {
         while IFS= read -r -d '' p; do
             apply_one_patch "${p}" -d "${BUILD_SRC}" -p1
         done < <(find "${pdir}" -name '*.patch' -print0 | sort -z)
+        # The patchset patches the vendored bindgen crate in place; cargo
+        # verifies vendored files against .cargo-checksum.json at build
+        # time and dies on the mismatch.  Same sed as the ebuild's
+        # moz_clear_vendor_checksums bindgen.
+        sed -i -e 's/\("files":{\)[^}]*/\1/' \
+            "${BUILD_SRC}"/third_party/rust/bindgen/.cargo-checksum.json \
+            || die "failed to clear bindgen cargo checksums"
+        log "  cleared cargo checksums for the patched bindgen crate"
     fi
 
     # version-sensitive LibreWolf patch selection (same as src_prepare)
@@ -502,6 +526,18 @@ stage_prepare() {
     log "LibreWolf patch version selection: ${lw_ver}"
 
     cd "${BUILD_SRC}" || die "source tree missing: ${BUILD_SRC} (run the prepare stage first)"
+
+    # toolchain fixes: GCC-16 libstdc++ no longer leaks the C math
+    # functions into the global namespace in C++; upstream 156 has
+    # unqualified calls.  Regular TUs get std::-qualified forms (the
+    # siblings elsewhere are already qualified); the vendored pipewire
+    # json-core.h is also included by the libwebrtc gn TUs, where glibc's
+    # math.h macros precede libstdc++ cmath and would even rewrite the
+    # token inside std::isnormal - so there the compiler builtins are
+    # used directly, which work in both C and C++.
+    apply_one_patch "${SRC_ROOT}/root-patches/media-capabilities-std-isfinite.patch" -p1
+    apply_one_patch "${SRC_ROOT}/root-patches/webtransport-std-isnan.patch" -p1
+    apply_one_patch "${SRC_ROOT}/root-patches/pipewire-json-math-builtins.patch" -p1
 
     local FILES="${SRC_ROOT}"
 
@@ -758,10 +794,38 @@ PWAMOZ
            "${ni_src}/"*.conf "${ni_src}/moz.build" \
            netwerk/base/rozelynx-netiface/
         sed -i '/"url-classifier",/a\    "base/rozelynx-netiface",' netwerk/moz.build
-        apply_one_patch "${ni_src}/net-iface-necko.patch" -p1
+        # Same version-conditional necko patch as the ebuild's src_prepare:
+        # the plain net-iface-necko.patch carries the pre-157 hunks, the
+        # -157/-158 follow-ups are the full self-contained rework rebased
+        # per Firefox major (upstream signature drift: FromUnspecEntry
+        # gained aFromStaleCache in 158).
+        if ver_ge "${FIREFOX_VERSION}" 158.0; then
+            apply_one_patch "${ni_src}/net-iface-necko-158.patch" -p1
+        elif ver_ge "${FIREFOX_VERSION}" 157.0; then
+            apply_one_patch "${ni_src}/net-iface-necko-157.patch" -p1
+        else
+            apply_one_patch "${ni_src}/net-iface-necko.patch" -p1
+        fi
+        # RozeLynx v14: WebRTC ICE follows the interface assignment
+        # (SO_BINDTODEVICE on the mtransport sockets, bound STUN/TURN DNS,
+        # socket-process tab-map replica, per-interface host candidates).
+        apply_one_patch "${ni_src}/net-iface-webrtc.patch" -p1
         apply_one_patch "${ni_src}/net-iface-provider-host-native-fix.patch" -p1
         apply_one_patch "${ni_src}/net-iface-ext-dns.patch" -p1
         apply_one_patch "${ni_src}/net-iface-sessionrestore.patch" -p1
+    fi
+
+    # --- pam-passkeys: local WebAuthn platform authenticator (PAM: howdy
+    # face authentication first, account password fallback) ---
+    if use pam-passkeys && use rozelynx; then
+        log "RozeLynx: PAM passkey platform authenticator (howdy + password)"
+        local pp_src="${FILES}/rozelynx/cpp/webauthn-pam"
+        mkdir -p dom/webauthn/rozelynx-pam
+        cp "${pp_src}/"*.cpp "${pp_src}/"*.h "${pp_src}/moz.build" \
+           dom/webauthn/rozelynx-pam/
+        apply_one_patch "${pp_src}/webauthn-pam-service.patch" -p1
+        apply_one_patch "${pp_src}/webauthn-pam-prompt-helper.patch" -p1
+        apply_one_patch "${pp_src}/webauthn-pam-static-prefs.patch" -p1
     fi
 
     # --- LibreWolf-style privacy patches (vendored in this overlay) ---
@@ -791,7 +855,17 @@ PWAMOZ
     fi
     use extension-firewall && { apply_one_patch "${LW}/rs-blocker.patch" -p1; any_lw_patch=1; }
     use remove-pingsender && { apply_one_patch "${LW}/remove-pingsender.patch" -p1; any_lw_patch=1; }
-    use remove-openai && { apply_one_patch "${LW}/remove-openai.patch" -p1; any_lw_patch=1; }
+    if use remove-openai; then
+        # 158: toolkit/content/license.html is gone (generated from the
+        # LICENSES moz.build declarations now); remove-openai-158 swaps
+        # the license.html hunk for the ml/moz.build LICENSED_UNDER one.
+        if ver_ge "${FIREFOX_VERSION}" 158.0; then
+            apply_one_patch "${LW}/remove-openai-158.patch" -p1
+        else
+            apply_one_patch "${LW}/remove-openai.patch" -p1
+        fi
+        any_lw_patch=1
+    fi
     use webgl-permission && { apply_one_patch "${LW}/webgl-permission.patch" -p1; any_lw_patch=1; }
     if use fingerprint-fixes; then
         apply_one_patch "${LW}/fpp-canvas-fix.patch" -p1
@@ -832,6 +906,7 @@ PWAMOZ
             apply_one_patch "${LW}/fullpage-translations-utils-154.patch" -p1
         fi
         apply_one_patch "${LW}/fullpage-translations-customization.patch" -p1
+        apply_one_patch "${SRC_ROOT}/rozelynx/fullpage-translations-reliability.patch" -p1
         any_lw_patch=1
     fi
     use extension-uninstall-url && { apply_one_patch "${LW}/extensions-setUninstallURL.patch" -p1; any_lw_patch=1; }
@@ -854,7 +929,13 @@ PWAMOZ
             log "  skipping firefox-view.patch (upstreamed in 154)"
         fi
         apply_one_patch "${LW}/ui-patches/handlers.patch" -p1
-        apply_one_patch "${LW}/ui-patches/neterror.patch" -p1
+        # 158: net-error-card.mjs wrapped the img-container in an
+        # ILLUSTRATION_ENABLED conditional - neterror-158 is rebased for it.
+        if ver_ge "${FIREFOX_VERSION}" 158.0; then
+            apply_one_patch "${LW}/ui-patches/neterror-158.patch" -p1
+        else
+            apply_one_patch "${LW}/ui-patches/neterror.patch" -p1
+        fi
         apply_one_patch "${LW}/ui-patches/pref-naming.patch" -p1
         apply_one_patch "${LW}/ui-patches/home-preferences.patch" -p1
         apply_one_patch "${LW}/ui-patches/trustpanel.patch" -p1
@@ -905,6 +986,17 @@ PWAMOZ
     [[ -n ${ROZELYNX_API_KEY_LOCATION:-} ]] && printf '%s' "${ROZELYNX_API_KEY_LOCATION}" > api-location.key
     [[ -n ${ROZELYNX_API_KEY_MOZILLA:-} ]] && printf '%s' "${ROZELYNX_API_KEY_MOZILLA}" > api-mozilla.key
 
+    # rozelynx point release: the app version can be bumped past the pinned
+    # Firefox base (APP_VERSION, e.g. 158.0.1 on firefox-158.0) for
+    # rozelynx-only fixes. application.ini, the omnijar version bits and
+    # every update check derive from these two files; the Gecko milestone
+    # (config/milestone.txt) stays at the base version.
+    if [[ ${APP_VERSION} != "${FIREFOX_VERSION}" ]]; then
+        printf '%s\n' "${APP_VERSION}" > browser/config/version.txt
+        printf '%s\n' "${APP_VERSION}" > browser/config/version_display.txt
+        log "  rozelynx point release: app version ${APP_VERSION} on firefox ${FIREFOX_VERSION}"
+    fi
+
     log "prepare complete: ${BUILD_SRC}"
 }
 
@@ -950,7 +1042,6 @@ stage_configure() {
     add_ac "--disable-parental-controls"
     add_ac "--disable-strip"
     add_ac "--disable-updater"
-    add_ac "--disable-wmf"
     add_ac "--enable-negotiateauth"
     add_ac "--enable-new-pass-manager"
     add_ac "--enable-packed-relative-relocs"
@@ -1020,7 +1111,7 @@ stage_configure() {
     local backends=""
     use jack && backends+="jack,"
     use sndio && backends+="sndio,"
-    use pulseaudio && backends+="pulse,"
+    use pulseaudio && backends+="pulseaudio,"
     use pulseaudio || backends+="alsa,"
     add_ac "--enable-audio-backends=${backends%,}"
 
@@ -1070,9 +1161,12 @@ stage_configure() {
     fi
 
     # relocatable rpath: $ORIGIN works for system installs, AppImage,
-    # Flatpak (/app) and snap ($SNAP) alike because the libs sit next to
-    # the binary.
-    export LDFLAGS="${LDFLAGS:-} -Wl,-rpath,\$ORIGIN -Wl,--enable-new-dtags"
+    # Flatpak (/app) and snap ($SNAP) alike because the libs sit next to the
+    # binary.  The $ORIGIN must be single-quoted: mach configure (156+)
+    # shell-splits LDFLAGS with mozshellutil, which rejects unquoted
+    # metacharacters (MetaCharacterException), and the build system's
+    # make_quote(shell_quote()) pipeline re-quotes it correctly at link time.
+    export LDFLAGS="${LDFLAGS:-} -Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags"
 
     {
         echo "mk_add_options MOZ_OBJDIR=${OBJDIR}"
@@ -1129,7 +1223,7 @@ render_launcher() {  # render_launcher TEMPLATE OUT PREFIX_EXPR LIBDIR WAYLAND
         -e "s#^\(\(export \)\{0,1\}PREFIX=\).*#\1\"${prefix_expr}\"#" \
         -e "s#^\(\(export \)\{0,1\}DEFAULT_WAYLAND=\).*#\1\"${wayland}\"#" \
         -e "s#^\(MOZ_LAUNCHER=\).*#\1\"\${PREFIX}/${libdir}/rozelynx/rozelynx\"#" \
-        -e "s#^\(\(export \)\{0,1\}ROZELYNX_VERSION=\).*#\1\"${FIREFOX_VERSION}\"#" \
+        -e "s#^\(\(export \)\{0,1\}ROZELYNX_VERSION=\).*#\1\"${APP_VERSION}\"#" \
         -e "s#^\(\(export \)\{0,1\}ROZELYNX_BUILD=\).*#\1\"$(date -u +%Y-%m-%d)\"#" \
         -e 's#^\(export \)\{0,1\}MOZ_USER_DIR=.*#export MOZ_USER_DIR="${MOZ_USER_DIR:-${HOME}/.config/rozelynx}"#' \
         "${tmpl}" > "${out}"
@@ -1167,7 +1261,7 @@ stage_install() {
     cat > "${FIVE}/distribution/distribution.ini" <<EOF
 [Global]
 id=rozelynx
-version=${FIREFOX_VERSION}
+version=${APP_VERSION}
 about=RozeLynx Web Browser by ByteWheel
 
 [Preferences]
@@ -1400,6 +1494,11 @@ EOF
         # --- desktop file + launcher ---
         log "installing desktop file + launcher"
         mkdir -p "${STAGE}${PREFIX}/share/applications" "${STAGE}${PREFIX}/bin"
+        # mach install leaves usr/bin/<app> as a symlink to the ABSOLUTE
+        # /usr/<libdir>/rozelynx/rozelynx path; writing the real launcher
+        # through it would escape the staging tree (and clobber a live
+        # system file when running as root).  Remove it first.
+        rm -f "${STAGE}${PREFIX}/bin/rozelynx"
         sed -e 's#^Icon=.*#Icon=rozelynx#' \
             "${SRC_ROOT}/rozelynx/icon/rozelynx.desktop" \
             > "${STAGE}${PREFIX}/share/applications/rozelynx.desktop"
@@ -1409,6 +1508,12 @@ EOF
         if [[ ${SYMLINK_FIREFOX} == yes ]]; then
             ln -sf rozelynx "${STAGE}${PREFIX}/bin/firefox"
         fi
+    fi
+
+    # pam-passkeys: ship the PAM service example with the staged tree
+    if use pam-passkeys && use rozelynx; then
+        install -Dm0644 "${SRC_ROOT}/rozelynx/cpp/webauthn-pam/rozelynx.pam" \
+            "${STAGE}${PREFIX}/share/doc/rozelynx/pam.d/rozelynx"
     fi
 
     # net-iface CAP_NET_RAW (xattrs survive tar --xattrs and snap pack)
@@ -1439,7 +1544,7 @@ stage_package() {
         || die "staging tree missing - run the install stage first"
 
     if [[ ${PKG_TARBALL} == yes ]]; then
-        local out="${DIST}/rozelynx-${FIREFOX_VERSION}-${ARCH}.tar.xz"
+        local out="${DIST}/rozelynx-${APP_VERSION}-${ARCH}.tar.xz"
         log "packaging tarball: ${out}"
         (cd "${STAGE}" && tar --xattrs --xattrs-include='*.*' -cJf "${out}" usr) \
             || die "tarball packaging failed"
@@ -1503,13 +1608,16 @@ EOF
         -resize 256x256 "${appdir}/rozelynx.png" 2>/dev/null \
         || cp "${appdir}${PREFIX}/share/icons/hicolor/128x128/apps/rozelynx.png" "${appdir}/rozelynx.png"
 
-    local out="${DIST}/RozeLynx-${FIREFOX_VERSION}-${ARCH}.AppImage"
+    local out="${DIST}/RozeLynx-${APP_VERSION}-${ARCH}.AppImage"
     log "running appimagetool (${tool})"
     ARCH_APPIMAGE_EXTRACT_AND_RUN=1 "${tool}" "${appdir}" "${out}" \
         || die "appimagetool failed"
     log "  done: ${out}"
     if use net-iface; then
         warn "net-iface in an AppImage: squashfs mounts are nosuid - file capabilities do not apply; grant cap_net_raw to the extracted binary if you need interface pinning"
+    fi
+    if use pam-passkeys; then
+        warn "pam-passkeys in an AppImage: /etc/pam.d of the host is reachable, but the bundled libpam stack may miss the howdy module - check with 'howdy test' on the host; USB security keys always work"
     fi
     return 0
 }
@@ -1541,8 +1649,15 @@ pkg_flatpak() {
     chmod 0755 "${payload_root}/bin/rozelynx"
     mv "${payload_root}/share/applications/rozelynx.desktop" \
        "${payload_root}/share/applications/org.bytewheel.rozelynx.desktop"
-    local payload="${fbdir}/rozelynx-${FIREFOX_VERSION}-payload.tar.xz"
+    local payload="${fbdir}/rozelynx-${APP_VERSION}-payload.tar.xz"
     (cd "${payload_root}" && tar -cJf "${payload}" .) || die "payload tar failed"
+
+    # howdy face authentication (pam-passkeys) needs the camera
+    local pam_extra_finish_args=""
+    if use pam-passkeys; then
+        pam_extra_finish_args=","$'\n'"    \"--device=all\""
+        warn "pam-passkeys in a flatpak: --device=all grants the camera for howdy; the PAM stack is still the runtime's - face auth may be unavailable and only the password prompt works"
+    fi
 
     cat >"${fbdir}/org.bytewheel.rozelynx.json" <<EOF
 {
@@ -1560,7 +1675,7 @@ pkg_flatpak() {
     "--device=dri",
     "--filesystem=xdg-download",
     "--talk-name=org.freedesktop.Notifications",
-    "--talk-name=org.freedesktop.portal.*"
+    "--talk-name=org.freedesktop.portal.*"${pam_extra_finish_args}
   ],
   "modules": [
     {
@@ -1590,7 +1705,7 @@ EOF
         "${fbdir}/build" "${fbdir}/org.bytewheel.rozelynx.json" \
         || die "flatpak-builder failed"
 
-    local out="${DIST}/RozeLynx-${FIREFOX_VERSION}.flatpak"
+    local out="${DIST}/RozeLynx-${APP_VERSION}.flatpak"
     log "flatpak build-bundle"
     flatpak build-bundle "${repo}" "${out}" org.bytewheel.rozelynx \
         || die "flatpak build-bundle failed"
@@ -1618,7 +1733,7 @@ pkg_snap() {
     mkdir -p "${primedir}/meta/gui/icons"
     cat >"${primedir}/meta/snap.yaml" <<EOF
 name: rozelynx
-version: "${FIREFOX_VERSION}"
+version: "${APP_VERSION}"
 summary: RozeLynx Web Browser
 description: |
   RozeLynx: a Firefox-based browser by ByteWheel with Floorp-derived
@@ -1654,7 +1769,7 @@ EOF
         || cp "${primedir}/usr/share/icons/hicolor/128x128/apps/rozelynx.png" \
               "${primedir}/meta/gui/icons/rozelynx.png"
 
-    local out="${DIST}/rozelynx_${FIREFOX_VERSION}_${SNAP_ARCH}.snap"
+    local out="${DIST}/rozelynx_${APP_VERSION}_${SNAP_ARCH}.snap"
     if command -v snap >/dev/null 2>&1 && snap pack --help >/dev/null 2>&1; then
         log "snap pack"
         snap pack "${primedir}" "${DIST}" || die "snap pack failed"
@@ -1671,6 +1786,9 @@ EOF
     [[ -n ${out} ]] && log "  done: ${out}"
     if use net-iface; then
         warn "net-iface in a strict snap: file capabilities are dropped by the confinement stack; run the binary unconfined or grant CAP_NET_RAW via a snap layout/daemon"
+    fi
+    if use pam-passkeys; then
+        warn "pam-passkeys in a strict snap: PAM service files and the howdy module live outside the sandbox - local passkeys will likely fail verification and fall back to USB security keys"
     fi
 }
 

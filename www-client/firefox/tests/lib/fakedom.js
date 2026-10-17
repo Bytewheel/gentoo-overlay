@@ -84,6 +84,19 @@ class El {
   addEventListener(t, fn) { (this._listeners[t] || (this._listeners[t] = [])).push(fn); }
   removeEventListener(t, fn) { const a = this._listeners[t]; if (!a) return; const i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); }
   dispatch(t, ev) { const a = this._listeners[t]; if (!a) return; for (const fn of a.slice()) fn(ev); }
+  // The real click() propagates - capture-phase listeners from the root down,
+  // the element's own listeners, then bubble-phase back up - so a listener on
+  // the document sees a click on any descendant. Element-local dispatch()
+  // shows it nothing, and the release path of downloads-handoff/content.js
+  // under test registers exactly there: a click() that stops at the element
+  // would test no interception at all. A plain El outside a makeEnv() tree
+  // has no _click installed and falls back to dispatch().
+  click() {
+    let root = this;
+    while (root && root.parentNode) root = root.parentNode;
+    if (root && root !== this && typeof root._click === 'function') { root._click(this); return; }
+    this.dispatch('click', makeEvent('click', { target: this, button: 0 }));
+  }
   closest(sel) {
     let n = this;
     while (n) {
@@ -96,13 +109,20 @@ class El {
     return String(sel).split(',').some(part => {
       const s = part.trim();
       if (s === '*') return true;
-      const m = /^([a-z0-9]+)?((?:[.#][\w-]+)*)$/i.exec(s);
+      // tag, then any run of .class / #id / [attr] tokens. The [attr] form
+      // is what the menu-context walk under test uses ('a[href]', 'img'),
+      // and a selector the fake cannot parse must not silently match.
+      const m = /^([a-z0-9]+)?((?:[.#][\w-]+|\[[\w-]+\])*)$/i.exec(s);
       if (!m) return false;
       if (m[1] && this.tagName !== m[1].toUpperCase()) return false;
       if (m[2]) {
-        for (const tok of m[2].match(/[.#][\w-]+/g) || []) {
+        for (const tok of m[2].match(/[.#][\w-]+|\[[\w-]+\]/g) || []) {
           if (tok[0] === '.' && !this.classList.contains(tok.slice(1))) return false;
           if (tok[0] === '#' && this._id !== tok.slice(1)) return false;
+          if (tok[0] === '[' &&
+              !Object.prototype.hasOwnProperty.call(this.attributes, tok.slice(1, -1))) {
+            return false;
+          }
         }
       }
       return true;
@@ -160,17 +180,35 @@ function makeEnv(opts) {
     documentElement,
     body,
     title: 'Harness page',
+    // Real documents always have a base URL; URL-with-base parsing (the save
+    // paths) needs it, and a missing one silently turns "parse the URL"
+    // into "no suggested filename" rather than a loud failure.
+    baseURI: 'https://example.com/page',
     execCommand() { return true; },
     _listeners: {},
   });
   doc.tagName = '#DOCUMENT';
 
   const listeners = { doc: {}, win: {} };
+  // Recordings the same way as `sent`: what downloads.download was asked
+  // for, what onCreated was registered, and what location.assign navigated
+  // to. All three are load-bearing for the save/release paths under test:
+  // the download options are the assertion, and the Layer-B re-entry of a
+  // release's own restore must be observable as "onCreated was called and
+  // declined" rather than as nothing.
+  const downloadCalls = [];
+  const onCreated = [];
+  const assigned = [];
 
+  const location_ = {
+    href: 'https://example.com/page',
+    protocol: 'https:',
+    assign(u) { assigned.push(String(u)); this.href = String(u); },
+  };
   const window = {
     innerWidth: 1280,
     innerHeight: 900,
-    location: { href: 'https://example.com/page', protocol: 'https:' },
+    location: location_,
     history: { length: 2, back() {}, forward() {} },
     print() {},
     open() { return null; },
@@ -186,6 +224,23 @@ function makeEnv(opts) {
   window.window = window;
 
   doc.addEventListener = function (t, fn, capture) { (listeners.doc[t] || (listeners.doc[t] = [])).push({ fn, capture: !!capture }); };
+  // click() for a makeEnv tree: the propagation described on El. The
+  // document registers through `listeners.doc`, every other El through its
+  // own `_listeners`, so the walk reads both registries.
+  doc._click = function (target) {
+    const chain = [];
+    for (let n = target; n; n = n.parentNode) chain.unshift(n);
+    const ev = makeEvent('click', { target: target, button: 0 });
+    const regs = (node) => (node === doc
+      ? (listeners.doc['click'] || []).map(({ fn, capture }) => ({ fn, capture }))
+      : ((node._listeners && node._listeners['click']) || []).map(fn => ({ fn, capture: false })));
+    (listeners.win['click'] || []).forEach(({ fn, capture }) => { if (capture) fn.call(window, ev); });
+    chain.slice(0, -1).forEach(node => regs(node).forEach(({ fn, capture }) => { if (capture) fn.call(node, ev); }));
+    ((chain[chain.length - 1]._listeners['click']) || []).slice()
+      .forEach(fn => fn.call(target, ev));
+    chain.slice(0, -1).reverse().forEach(node => regs(node).forEach(({ fn, capture }) => { if (!capture) fn.call(node, ev); }));
+    (listeners.win['click'] || []).forEach(({ fn, capture }) => { if (!capture) fn.call(window, ev); });
+  };
   doc.createElementNS = function (ns, tag) {
     const e = new El(tag);
     e.getContext = () => ({
@@ -244,6 +299,30 @@ function makeEnv(opts) {
       },
       onChanged: { addListener(fn) { onChanged.push(fn); } },
     },
+    // Recorded rather than a no-op: the save paths under test assert WHAT was
+    // downloaded and how, and a no-op stub cannot report its own arguments.
+    // `opts.download` is a function (or a {__reject} reply) that decides the
+    // outcome per call, so a harness can make the picker cancel, refuse a
+    // suggested filename, or fail outright.
+    downloads: {
+      download(dopts) {
+        const call = Object.assign({}, dopts);
+        downloadCalls.push(call);
+        let r;
+        try {
+          r = typeof opts.download === 'function' ? opts.download(call) : opts.download;
+        } catch (e) {
+          r = Promise.reject(e);
+        }
+        if (r && r.__reject) return Promise.reject(new Error(r.error || 'download refused'));
+        return Promise.resolve(r === undefined ? 42 : r);
+      },
+      // Nothing fires these by itself in a harness; a test that wants the
+      // Layer-B view of a release's own restore pushes an item here.
+      onCreated: { addListener(fn) { onCreated.push(fn); } },
+      cancel(id) { downloadCalls.push({ action: 'cancel', id }); return Promise.resolve(true); },
+      erase() { return Promise.resolve(); },
+    },
   };
 
   class MO { constructor(fn) { this.fn = fn; } observe() {} disconnect() {} }
@@ -279,7 +358,8 @@ function makeEnv(opts) {
   };
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
-  return { sandbox, fire, storage, sent, onChanged, logs, replies, doc, window, documentElement, timers };
+  return { sandbox, fire, storage, sent, onChanged, logs, replies, doc, window, documentElement, timers,
+           downloadCalls, onCreated, assigned };
 }
 
 module.exports = { makeEnv, El, makeEvent };

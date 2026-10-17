@@ -80,7 +80,7 @@ const BG_SRC = path.join(ROOT, 'modules/mouse-gestures/background.js');
 
 function loadPair(opts) {
   opts = opts || {};
-  const env = makeEnv({ replies: opts.replies });
+  const env = makeEnv({ replies: opts.replies, download: opts.download });
   const bg = { listeners: [] };
   // Wrap addListener itself rather than registering a listener of our own: the
   // fake's addListener keeps only the last one, so a listener added here would
@@ -574,6 +574,171 @@ async function main() {
   ok(!env.documentElement.querySelector('#rozelynx-menus-bridge'),
      '12.10 no menus iframe is injected into the page any more');
   eq(env.storage.rozelynx_menu_click, undefined, '12.11 and clicks have no storage channel either');
+}
+
+// ===========================================================================
+// 13. Save ... As... — routed through the background, picker and all
+// ===========================================================================
+//
+// The old saveAs() clicked a synthetic <a download> in the page, and that
+// never worked: the download attribute only applied same-origin (hence the
+// old isSameOrigin() gates, which hid the entries for most images), there
+// was no Save dialog at all - a silent drop into the download folder - and
+// with download-handoff enabled, its capture-phase click hook ate the click
+// and location.assign()'d the tab to the image instead of saving anything.
+// These drive the real pair the way the fixed code runs: the content script
+// sends {module:'mouse-gestures', action:'saveAs'} and the background calls
+// downloads.download({saveAs:true}), the browser's own file picker.
+{
+  // cross-origin image: the entry exists, and the round-trip reaches
+  // downloads.download
+  const { El } = require('./lib/fakedom');
+  const env = loadPair({});
+  await tick();
+  const img = new El('img');
+  img.setAttribute('src', 'https://other.example.net/pic.png');
+  env.doc.body.appendChild(img);
+  rightClick(env, img);
+  await tick();
+  const saveItem = menu(env).children.filter(c => c.textContent === 'Save Image As...')[0];
+  ok(!!saveItem, '13.1 Save Image As... is offered for a CROSS-ORIGIN image (the old isSameOrigin() gate is gone)');
+  saveItem.dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  eq(env.downloadCalls.length, 1, '13.2 exactly one download was started',
+    JSON.stringify(env.downloadCalls));
+  ok(env.downloadCalls[0] && env.downloadCalls[0].saveAs === true,
+    '13.3 with saveAs:true, the browser\'s own Save picker');
+  eq(env.downloadCalls[0] && env.downloadCalls[0].url, 'https://other.example.net/pic.png',
+    '13.4 for the image\'s own cross-origin URL');
+  ok(!menu(env), '13.5 and the menu closed');
+  ok(env.downloadCalls[0] && !('filename' in env.downloadCalls[0]),
+    '13.6 no filename hint rides an http(s) URL - the browser derives the picker name');
+}
+{
+  // link and media entries take the same road
+  const { El } = require('./lib/fakedom');
+  const env = loadPair({});
+  await tick();
+  const a = new El('a');
+  a.setAttribute('href', 'https://dl.example.net/file.zip');
+  a.textContent = 'file';
+  env.doc.body.appendChild(a);
+  rightClick(env, a);
+  await tick();
+  const linkItem = menu(env).children.filter(c => c.textContent === 'Save Link As...')[0];
+  ok(!!linkItem, '13.7 Save Link As... is offered for every link');
+  linkItem.dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  eq(env.downloadCalls[0] && [env.downloadCalls[0].url, env.downloadCalls[0].saveAs],
+    ['https://dl.example.net/file.zip', true], '13.8 the link saves through the same path');
+
+  const env2 = loadPair({});
+  await tick();
+  const v = new El('video');
+  v.setAttribute('src', 'https://media.example.net/clip.mp4');
+  env.doc.body.appendChild(v);
+  rightClick(env2, v);
+  await tick();
+  const mediaItem = menu(env2).children.filter(c => c.textContent === 'Save As...')[0];
+  ok(!!mediaItem, '13.9 media gets its Save As... entry');
+  mediaItem.dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  eq(env2.downloadCalls[0] && env2.downloadCalls[0].url, 'https://media.example.net/clip.mp4',
+    '13.10 the media URL is what is saved');
+}
+{
+  // a data: URL carries no filename, so a name derived from its MIME type
+  // prefills the picker
+  const { El } = require('./lib/fakedom');
+  const env = loadPair({});
+  await tick();
+  const img = new El('img');
+  img.setAttribute('src', 'data:image/png;base64,AAAA');
+  env.doc.body.appendChild(img);
+  rightClick(env, img);
+  await tick();
+  menu(env).children.filter(c => c.textContent === 'Save Image As...')[0]
+    .dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  eq(env.downloadCalls[0] && [env.downloadCalls[0].filename, env.downloadCalls[0].saveAs],
+    ['image.png', true], '13.11 a data: URL prefills the picker from its MIME type');
+}
+{
+  // a suggested name the API refuses is retried without it, not lost
+  const { El } = require('./lib/fakedom');
+  const env = loadPair({
+    download: (call) => call.filename
+      ? { __reject: true, error: 'filename must not contain illegal characters' }
+      : 43,
+  });
+  await tick();
+  const img = new El('img');
+  img.setAttribute('src', 'data:image/png;base64,AAAA');
+  env.doc.body.appendChild(img);
+  rightClick(env, img);
+  await tick();
+  menu(env).children.filter(c => c.textContent === 'Save Image As...')[0]
+    .dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  eq(env.downloadCalls.length, 2, '13.12 a refused filename is retried without it',
+    JSON.stringify(env.downloadCalls));
+  ok(env.downloadCalls[1] && !('filename' in env.downloadCalls[1]),
+    '13.13 the retry carries no filename');
+  ok(env.downloadCalls[1] && env.downloadCalls[1].saveAs === true,
+    '13.14 and still shows the picker');
+}
+{
+  // a failed download toasts; a cancelled picker does not (it is the user's
+  // own decision, and the API rejects with exactly that message)
+  const { El } = require('./lib/fakedom');
+  const fail = loadPair({ download: () => ({ __reject: true, error: 'SERVER_BAD_CONTENT' }) });
+  await tick();
+  const img = new El('img');
+  img.setAttribute('src', 'https://broken.example.net/x.png');
+  fail.doc.body.appendChild(img);
+  rightClick(fail, img);
+  await tick();
+  menu(fail).children.filter(c => c.textContent === 'Save Image As...')[0]
+    .dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  const toast = fail.documentElement.querySelector('#rozelynx-gesture-feedback');
+  ok(!!toast && /Save As failed/.test(toast.textContent),
+    '13.15 a failed download toasts the failure', toast && toast.textContent);
+
+  const cancel = loadPair({
+    download: () => ({ __reject: true, error: 'Download canceled by the user' }),
+  });
+  await tick();
+  const img2 = new El('img');
+  img2.setAttribute('src', 'https://pick.example.net/y.png');
+  cancel.doc.body.appendChild(img2);
+  rightClick(cancel, img2);
+  await tick();
+  menu(cancel).children.filter(c => c.textContent === 'Save Image As...')[0]
+    .dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  const toast2 = cancel.documentElement.querySelector('#rozelynx-gesture-feedback');
+  ok(!toast2 || !/Save As failed/.test(toast2.textContent),
+    '13.16 a cancelled picker is not a failure - no toast', toast2 && toast2.textContent);
+}
+{
+  // no background at all (an event page that has not woken, or a build
+  // without the module): the entry point says so rather than doing nothing
+  const { El } = require('./lib/fakedom');
+  const env = load({});
+  const img = new El('img');
+  img.setAttribute('src', 'https://solo.example.net/z.png');
+  env.doc.body.appendChild(img);
+  rightClick(env, img);
+  await tick();
+  menu(env).children.filter(c => c.textContent === 'Save Image As...')[0]
+    .dispatch('click', { preventDefault() {} });
+  await tick(); await tick();
+  const toast = env.documentElement.querySelector('#rozelynx-gesture-feedback');
+  ok(!!toast && /RozeLynx background/.test(toast.textContent),
+    '13.17 with no background answering, the toast says so', toast && toast.textContent);
+  // and nothing was "downloaded" by the page anchor trick: no navigation
+  eq(env.assigned, [], '13.18 the tab is never navigated to the image');
 }
 
 // ===========================================================================

@@ -67,5 +67,6 @@
 	<flag name="ip-protection">Enable IP protection privacy UI overrides via RozeLynx Features extension (requires rozelynx)</flag>
  	<flag name="download-handoff">Hand downloads off to a configured download manager before the browser prompts. Manager-agnostic: any extension that answers a download message, any program on PATH, or the built-in uGet integrator (requires rozelynx)</flag>
  	<flag name="net-iface">Pin network traffic to specific interfaces via SO_BINDTODEVICE; grants CAP_NET_RAW to rozelynx binary (requires rozelynx)</flag>
+	<flag name="pam-passkeys">Local WebAuthn passkeys (platform authenticator): user verification runs through PAM - face recognition via howdy when the stack carries pam_howdy.so, the account password otherwise; credentials are ES256 keys stored in the browser profile; USB/NFC security keys keep working (requires rozelynx)</flag>
  </use>
 </pkgmetadata>
