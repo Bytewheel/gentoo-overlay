@@ -1,10 +1,4 @@
-*For my wife, my inspiration. YAMS*
-
-# CAUTION
-
-Please do not use this browser in sensitive operations without being aware of the risks!
-
-This software is provided as-is, without any warranty as expressed or implied.
+*For my wife, my inspiration. [YAMS](https://buymeacoffee.com/burningserenity)*
 
 # ByteWheel Gentoo overlay
 
@@ -41,6 +35,13 @@ auto-sync = no
 ```
 
 ## RozeLynx
+
+# CAUTION
+
+Please do not use this browser in sensitive operations without being aware of the risks!
+
+This software is provided as-is, without any warranty as expressed or implied.
+
 
 Firefox fork, including Librewolf and Floorp patches, plus more.
 
