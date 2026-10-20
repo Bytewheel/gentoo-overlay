@@ -1,0 +1,64 @@
+Link system libjpeg-turbo, freetype, harfbuzz, webp and ICU for
+targets that use Skia
+
+With is_official_build=true the aseprite/skia fork links the system
+libraries, so libskia.a's codec objects reference jpeg_*/FT_*/WebP*
+symbols and libskunicode.a references ICU symbols. These were only
+linked into app-lib (jpeg) or not at all (ICU), leaving the aseprite
+executable and laf test binaries with undefined references. Link them
+through the INTERFACE skia/skunicode targets so every consumer gets
+them.
+
+--- a/laf/cmake/FindSkia.cmake
++++ b/laf/cmake/FindSkia.cmake
+@@ -208,6 +208,38 @@
+   ${ZLIB_LIBRARIES}
+   ${PNG_LIBRARIES})
+ 
++# Skia is compiled against the system libraries when
++# is_official_build=true, so its codec/font objects need them at link
++# time. Find them fresh here as the HARFBUZZ_LIBRARIES/FREETYPE_*
++# variables from the parent scope may not be visible/reliable inside
++# this subdirectory.
++if(TARGET libjpeg-turbo)
++  target_link_libraries(skia INTERFACE libjpeg-turbo)
++else()
++  find_library(SKIA_LIBJPEG_LIBRARY NAMES libjpeg jpeg)
++  if(SKIA_LIBJPEG_LIBRARY)
++    target_link_libraries(skia INTERFACE ${SKIA_LIBJPEG_LIBRARY})
++  endif()
++endif()
++
++find_library(SKIA_FREETYPE_LIBRARY NAMES freetype)
++if(SKIA_FREETYPE_LIBRARY)
++  target_link_libraries(skia INTERFACE ${SKIA_FREETYPE_LIBRARY})
++endif()
++
++find_library(SKIA_HARFBUZZ_LIBRARY NAMES harfbuzz)
++if(SKIA_HARFBUZZ_LIBRARY)
++  target_link_libraries(skia INTERFACE ${SKIA_HARFBUZZ_LIBRARY})
++endif()
++
++find_library(SKIA_WEBP_LIBRARY NAMES webp)
++find_library(SKIA_WEBPDEMUX_LIBRARY NAMES webpdemux)
++find_library(SKIA_WEBPMUX_LIBRARY NAMES webpmux)
++if(SKIA_WEBP_LIBRARY)
++  target_link_libraries(skia INTERFACE
++    ${SKIA_WEBP_LIBRARY} ${SKIA_WEBPDEMUX_LIBRARY} ${SKIA_WEBPMUX_LIBRARY})
++endif()
++
+ if(WIN32)
+   target_compile_definitions(skia INTERFACE
+     SK_BUILD_FOR_WIN
+@@ -243,6 +275,11 @@
+ 
+ add_library(skunicode INTERFACE)
+ target_link_libraries(skunicode INTERFACE ${SKUNICODE_LIBRARY})
++
++# skunicode is compiled with the system ICU libraries
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(ICU_DEPS REQUIRED IMPORTED_TARGET icu-uc icu-i18n)
++target_link_libraries(skunicode INTERFACE PkgConfig::ICU_DEPS)
+ target_compile_definitions(skunicode INTERFACE
+   SK_UNICODE_AVAILABLE)
+ 

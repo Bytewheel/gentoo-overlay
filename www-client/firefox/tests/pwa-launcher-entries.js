@@ -28,6 +28,9 @@
  *   E  the entry content itself: --profile, --ssb-class, --ssb-icon, Icon=
  *   F  the Exec line and StartupWMClass agree with what the launch path uses
  *   G  message hygiene: unrelated messages are not swallowed
+ *   H  the icon ladder: candidates, favicons and the packaged fallback (1.0.73)
+ *   I  reconcile UPGRADES an entry whose Icon= fell behind (1.0.73)
+ *   J  PWAManager.install keeps the same ladder (1.0.73)
  */
 
 const fs = require('fs');
@@ -157,10 +160,38 @@ function loadPair(opts) {
   const ctx = vm.createContext({
     browser, console: con, URL, setTimeout, clearTimeout,
     setInterval, clearInterval, Promise, JSON, Math, Date, Object, Array, String,
-    Number, Boolean, Error, RegExp, fetch: () => Promise.reject(new Error('no net')),
+    Number, Boolean, Error, RegExp,
+    // The default is "no net" on purpose: every leg that is not about the
+    // network must stay on the offline path, and the fetch-requiring legs
+    // (H, J) stub their own through o.fetch.
+    fetch: o.fetch || (() => Promise.reject(new Error('no net'))),
     FileReader: function () { this.readAsDataURL = () => {}; },
     RozeLynxFeatures: { loadedModules, loadErrors: {}, initialized: true },
   });
+  if (o.dom) {
+    // A model of the background page's own DOM, for the canvas re-encode
+    // rung: an Image that always loads (1x1) and a canvas whose toDataURL
+    // answers a real 1x1 PNG. The DOM is not under test - the ladder's use
+    // of it is - and a real background page has exactly these globals.
+    ctx.Image = function () {
+      const img = { naturalWidth: 1, naturalHeight: 1, onload: null, onerror: null };
+      Object.defineProperty(img, 'src', {
+        get() { return ''; },
+        set() { setTimeout(() => { if (img.onload) img.onload(); }, 0); },
+      });
+      return img;
+    };
+    ctx.document = {
+      createElement() {
+        return {
+          width: 0,
+          height: 0,
+          getContext() { return { drawImage() {} }; },
+          toDataURL() { return DATA_PNG; },
+        };
+      },
+    };
+  }
   ctx.globalThis = ctx;
   vm.runInContext(fs.readFileSync(
     path.join(EXT, 'modules/pwa/background.js'), 'utf8'),
@@ -779,6 +810,343 @@ async function sectionG() {
   } finally { h.cleanup(); }
 }
 
+/* ---------------------------------------------------------------- H */
+
+/* The icon ladder (v1.0.73). A site with NO icon at all used to leave the
+ * entry on Icon=rozelynx - the hicolor name whose scalable slot is the
+ * discontinued old logo - and a site whose icon only existed as a URL the
+ * content script could not read (a CDN without CORS response headers)
+ * stored icon:null with no record of the URL, so nothing could retry it.
+ * The ladder answers all of that: the packaged fallback art materialises
+ * through the same parent write as a site icon, so the entry gets an
+ * absolute path a launcher renders directly. */
+async function sectionH() {
+  // The packaged artwork itself, served the way the background page reads
+  // it (fetch + arrayBuffer): the real bytes from the real file, so the
+  // check on the far side of the parent write is about the real asset.
+  const realPng = fs.readFileSync(path.join(EXT, 'icons/pwa-fallback.png'));
+  ok(realPng.length > 8 && realPng[0] === 0x89 && realPng[1] === 0x50,
+    'H.0 the packaged fallback asset exists and is a PNG',
+    realPng.length + ' bytes');
+  const serveFallback = () => Promise.resolve({
+    ok: true,
+    arrayBuffer: async () => realPng.buffer.slice(
+      realPng.byteOffset, realPng.byteOffset + realPng.length),
+  });
+
+  {
+    // A site with no icon: the entry must fall to the packaged art, not the
+    // theme name, and the site record must NOT be overwritten with it - the
+    // fallback is the browser's brand, not the site's favicon.
+    const s = site('NoIcon');
+    s.icon = null;
+    const h = await booted([s], { fetch: serveFallback });
+    try {
+      const body = h.entryFor(s);
+      const icon = body.split('\n').find(l => l.startsWith('Icon='))
+        .slice('Icon='.length);
+      ok(icon.endsWith(path.join('pwa-icons', 'rozelynx-pwa-fallback.png')),
+        'H.1 Icon= names the materialised fallback file', icon);
+      ok(path.isAbsolute(icon), 'H.2 ...as an absolute path', icon);
+      ok(fs.existsSync(icon), 'H.3 ...which exists on disk');
+      ok(fs.readFileSync(icon).equals(realPng),
+        'H.4 ...carrying the packaged artwork bytes');
+      ok(body.includes('--ssb-icon ' + icon),
+        'H.5 ...and --ssb-icon agrees with it');
+      ok(/source=fallback/.test(h.diagText()),
+        'H.6 the ring says which rung answered', h.diagText());
+      const sites = JSON.parse(h.storage.rozelynx_pwa_sites);
+      eq(sites[0].icon, null,
+        "H.7 the fallback is NOT stored as the site's own favicon");
+    } finally { h.cleanup(); }
+  }
+
+  {
+    // A site whose icon is only a candidate URL: the content script could
+    // not read it (CORS), the background can (host permissions). The entry
+    // must land on the candidate's bytes, re-encoded through the canvas to
+    // a PNG, and the record must be upgraded so the next pass is the fast
+    // first rung. `dom: true` models the background page's own Image and
+    // canvas, so the re-encode rung itself runs - against a canvas that
+    // answers the real 1x1 PNG, which is what the byte assertions read.
+    const png = Buffer.from('89504e47', 'hex');   // a PNG signature, loadable bytes
+    const s = site('CdnApp');
+    s.icon = null;
+    s.iconCandidates = ['https://cdn.example/icon-192.png'];
+    const h = await booted([s], {
+      dom: true,
+      fetch: (u) => {
+        if (String(u) === 'https://cdn.example/icon-192.png') {
+          return Promise.resolve({
+            ok: true,
+            arrayBuffer: async () => png.buffer.slice(
+              png.byteOffset, png.byteOffset + png.length),
+          });
+        }
+        return serveFallback();
+      },
+    });
+    try {
+      const body = h.entryFor(s);
+      const icon = body.split('\n').find(l => l.startsWith('Icon='))
+        .slice('Icon='.length);
+      ok(icon.endsWith(s.id + '.png'),
+        'H.8 a candidate the background CAN fetch lands as the site icon',
+        icon);
+      eq(fs.readFileSync(icon).toString('base64'),
+        DATA_PNG.split(',')[1],
+        'H.9 ...re-encoded through the canvas to the PNG it answers');
+      ok(/source=favicon/.test(h.diagText()),
+        'H.10 ...and the rung is named in the ring', h.diagText());
+      const sites = JSON.parse(h.storage.rozelynx_pwa_sites);
+      eq(sites[0].icon, DATA_PNG,
+        "H.11 the win is persisted into the site record (as the PNG data URL)");
+    } finally { h.cleanup(); }
+  }
+
+  {
+    // A live tab favicon (favIconUrl) is harvested when the record has
+    // neither an icon nor candidates - the third rung. The boot runs on
+    // the default no-net stub so the startup entry lands on Icon=rozelynx
+    // (nothing servable); the favicon arrives only with the tab, which is
+    // exactly how a real profile gets here: installed with no icon, then
+    // revisited.
+    const png = Buffer.from('89504e47', 'hex');   // a PNG signature
+    const s = site('LiveTab');
+    s.icon = null;
+    const h = await booted([s]);
+    try {
+      let faviconAsked = null;
+      h.ctx.fetch = (u) => {
+        faviconAsked = String(u);
+        return Promise.resolve({
+          ok: true,
+          arrayBuffer: async () => png.buffer.slice(
+            png.byteOffset, png.byteOffset + png.length),
+        });
+      };
+      h.ctx.browser.tabs.query = () => Promise.resolve([{
+        id: 1,
+        favIconUrl: 'https://live-tab.example/favicon.ico',
+      }]);
+      const r = await h.send({ module: 'pwa', action: 'reconcile-entries' });
+      eq(r.upgraded, 1, 'H.12 the stale entry is upgraded by the pass',
+        JSON.stringify(r));
+      eq(r.failed, 0, 'H.13 ...cleanly');
+      const body = h.entryFor(s);
+      const icon = body.split('\n').find(l => l.startsWith('Icon='))
+        .slice('Icon='.length);
+      ok(icon.endsWith(s.id + '.png'),
+        'H.14 a tab favicon reaches the entry when nothing else could', icon);
+      ok(fs.readFileSync(icon).equals(png), 'H.15 ...with its bytes');
+      eq(faviconAsked, 'https://live-tab.example/favicon.ico',
+        'H.16 ...fetched under this page\'s permissions, not the page\'s');
+    } finally { h.cleanup(); }
+  }
+
+  {
+    // No fallback servable (an old parent, a read-only profile - modelled
+    // here by a fetch that cannot answer): the entry degrades to the theme
+    // name exactly as before, and says which rung failed.
+    const s = site('NoNet');
+    s.icon = null;
+    const h = await booted([s]);
+    try {
+      const body = h.entryFor(s);
+      const icon = body.split('\n').find(l => l.startsWith('Icon='))
+        .slice('Icon='.length);
+      eq(icon, 'rozelynx',
+        'H.15 with nothing servable, the entry degrades to the theme name');
+      ok(!body.includes('--ssb-icon '),
+        'H.16 ...and no --ssb-icon is emitted for it');
+      ok(/source=none/.test(h.diagText()),
+        'H.17 ...and the ring names the rung', h.diagText());
+    } finally { h.cleanup(); }
+  }
+}
+
+/* ---------------------------------------------------------------- I */
+
+/* The second half of idempotence (v1.0.73): an entry that EXISTS is left
+ * alone only while its Icon= is one the pipeline still stands behind. The
+ * pre-1.0.73 writer emitted Icon=rozelynx for any site without a usable
+ * icon - so every entry installed before this version is one upgrade away,
+ * and the upgrade has to happen by itself, because the only other way to
+ * get it is to uninstall and reinstall each app by hand. */
+async function sectionI() {
+  const s = site('Alpha');
+  const h = await booted([s]);
+  try {
+    const name = h.files().find(f => f.includes(s.id));
+    const p = path.join(h.appDir, name);
+    const live = h.entryFor(s).split('\n')
+      .find(l => l.startsWith('Icon=')).slice('Icon='.length);
+    ok(live && fs.existsSync(live), 'I.0 the fresh entry carries a live icon', live);
+
+    // (1) the pre-1.0.73 entry: the theme-name fallback.
+    fs.writeFileSync(p,
+      fs.readFileSync(p, 'utf8').replace(/^Icon=.*$/m, 'Icon=rozelynx'));
+    let r = await h.send({ module: 'pwa', action: 'reconcile-entries' });
+    eq(r.upgraded, 1, 'I.1 a theme-name Icon= is upgraded');
+    eq(r.written, 0, 'I.2 ...counted as an upgrade, not a fresh write');
+    eq(r.present, 0, 'I.3 ...and not as present');
+    eq(r.failed, 0, 'I.4 ...cleanly');
+    let icon = h.entryFor(s).split('\n')
+      .find(l => l.startsWith('Icon=')).slice('Icon='.length);
+    ok(icon.startsWith(path.join(h.sb.profd, 'pwa-icons')),
+      'I.5 the rewritten entry carries a real path', icon);
+    ok(fs.existsSync(icon), 'I.6 ...that exists');
+    // and the rewrite is not a footgun: the second pass sees it as present.
+    r = await h.send({ module: 'pwa', action: 'reconcile-entries' });
+    eq(r.present, 1, 'I.7 an upgraded entry is present on the next pass');
+    eq(r.upgraded, 0, 'I.8 ...and upgrades nothing again');
+
+    // (2) an absolute path whose file has gone away: the cleaned-profile
+    // case. The materialised file comes back as part of the rewrite, so
+    // the new entry is live again, not circular.
+    fs.unlinkSync(icon);
+    r = await h.send({ module: 'pwa', action: 'reconcile-entries' });
+    eq(r.upgraded, 1, 'I.9 an entry whose icon file was deleted is rewritten');
+    icon = h.entryFor(s).split('\n')
+      .find(l => l.startsWith('Icon=')).slice('Icon='.length);
+    ok(fs.existsSync(icon), 'I.10 ...and points at a file that exists again');
+
+    // (3) a blank Icon= - the "blank icon" half of the live complaint - is
+    // upgraded too, not tolerated because the file is technically there.
+    fs.writeFileSync(p,
+      fs.readFileSync(p, 'utf8').replace(/^Icon=.*$/m, 'Icon='));
+    r = await h.send({ module: 'pwa', action: 'reconcile-entries' });
+    eq(r.upgraded, 1, 'I.11 an empty Icon= is upgraded');
+    icon = h.entryFor(s).split('\n')
+      .find(l => l.startsWith('Icon=')).slice('Icon='.length);
+    ok(icon && fs.existsSync(icon), 'I.12 ...to a real file');
+
+    // (4) a parent that reports NO icon field (an older build) cannot be
+    // known: present, untouched - not rewritten on a guess, which would be
+    // every entry on every start-up forever.
+    const realHas = h.winApi.hasDesktopEntry;
+    const before = fs.statSync(p).mtimeMs;
+    h.winApi.hasDesktopEntry = (fn) =>
+      realHas(fn).then(({ icon, iconExists, ...rest }) => rest);
+    r = await h.send({ module: 'pwa', action: 'reconcile-entries' });
+    eq(r.present, 1, 'I.13 an old parent reports present');
+    eq(r.upgraded, 0, 'I.14 ...and triggers no rewrite');
+    eq(fs.statSync(p).mtimeMs, before, 'I.15 ...the file is untouched');
+    h.winApi.hasDesktopEntry = realHas;
+  } finally { h.cleanup(); }
+}
+
+/* ---------------------------------------------------------------- J */
+
+/* PWAManager.install has no caller in the extension (the live path is the
+ * content script's installPWA), but it is kept correct anyway - so its icon
+ * half keeps the same ladder. Driven with a fetch stub because the module
+ * fetches the manifest itself, this section proves the ranked ladder, the
+ * candidates kept on failure, and the entry still landing on a real icon
+ * file when the record itself could not hold one. */
+async function sectionJ() {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ' +
+    'AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  const manifest = {
+    name: 'JApp',
+    short_name: 'JApp',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    icons: [
+      { src: '/icons/blocked.webp', sizes: '512x512', type: 'image/webp',
+        purpose: 'any' },
+      { src: 'https://cdn.example/icon-192.png', sizes: '192x192',
+        type: 'image/png', purpose: 'any' },
+    ],
+  };
+  const h = await booted([], {
+    // dom: the ranked PNG candidate is re-encoded through the background
+    // page's canvas before it is stored - the same rung as H.9 - and this
+    // sandbox has no canvas of its own to agree with.
+    dom: true,
+    fetch: (u) => {
+      if (String(u).endsWith('/manifest.json')) {
+        return Promise.resolve({ ok: true, json: async () => manifest });
+      }
+      if (String(u) === 'https://cdn.example/icon-192.png') {
+        return Promise.resolve({
+          ok: true,
+          arrayBuffer: async () => png.buffer.slice(
+            png.byteOffset, png.byteOffset + png.length),
+        });
+      }
+      // A CORS-refusing CDN: the URL is kept as a candidate.
+      return Promise.resolve({ ok: false, status: 404 });
+    },
+  });
+  try {
+    const data = { url: 'https://app9.example/',
+      manifestUrl: 'https://app9.example/manifest.json' };
+    const r = await h.send({ module: 'pwa', action: 'install', data });
+    ok(r.success, 'J.1 the install succeeds', JSON.stringify(r && r.error));
+    const site = r.site;
+    eq(site.name, 'JApp', 'J.2 the site record carries the manifest name');
+    ok(/^data:image\/png[;,]/.test(String(site.icon || '')),
+      'J.3 the ranked PNG won and was stored as a PNG data URL',
+      String(site.icon).slice(0, 40));
+    eq(site.iconCandidates, [],
+      'J.4 a winner means no candidates are kept');
+    const sites = JSON.parse(h.storage.rozelynx_pwa_sites);
+    eq(sites.length, 1, 'J.5 the record is persisted');
+    const icon = h.entryFor(site).split('\n')
+      .find(l => l.startsWith('Icon=')).slice('Icon='.length);
+    ok(icon.endsWith(site.id + '.png'), 'J.6 the entry names the materialised icon', icon);
+    ok(fs.existsSync(icon) && fs.readFileSync(icon).equals(png),
+      'J.7 ...which is the candidate PNG on disk');
+  } finally { h.cleanup(); }
+
+  // And the blocked-icon half: a manifest whose ONLY icon is a URL this
+  // stub refuses. The record keeps the URL as a candidate; the entry still
+  // gets a real file through the fallback art - which is exactly what the
+  // packaged artwork exists for.
+  {
+    const realPng = fs.readFileSync(path.join(EXT, 'icons/pwa-fallback.png'));
+    const onlyBlocked = { name: 'KApp', start_url: '/', scope: '/',
+      display: 'standalone',
+      icons: [{ src: '/icons/blocked.png', sizes: '192x192',
+        type: 'image/png', purpose: 'any' }] };
+    const h2 = await booted([], {
+      dom: true,
+      fetch: (u) => {
+        if (String(u).endsWith('/manifest2.json')) {
+          return Promise.resolve({ ok: true, json: async () => onlyBlocked });
+        }
+        if (String(u).endsWith('blocked.png')) {
+          return Promise.resolve({ ok: false, status: 404 });
+        }
+        return Promise.resolve({
+          ok: true,
+          arrayBuffer: async () => realPng.buffer.slice(
+            realPng.byteOffset, realPng.byteOffset + realPng.length),
+        });
+      },
+    });
+    try {
+      const r2 = await h2.send({ module: 'pwa', action: 'install', data: {
+        url: 'https://kapp.example/',
+        manifestUrl: 'https://kapp.example/manifest2.json' } });
+      ok(r2.success, 'J.8 the blocked-icon install still succeeds',
+        JSON.stringify(r2 && r2.error));
+      ok(r2.site.iconCandidates.length === 1 &&
+         r2.site.iconCandidates[0].endsWith('/icons/blocked.png'),
+        'J.9 the refused URL is kept as a candidate',
+        JSON.stringify(r2.site.iconCandidates));
+      const icon2 = h2.entryFor(r2.site).split('\n')
+        .find(l => l.startsWith('Icon=')).slice('Icon='.length);
+      ok(icon2.endsWith(path.join('pwa-icons', 'rozelynx-pwa-fallback.png')),
+        'J.10 the entry lands on the packaged fallback art', icon2);
+      ok(fs.existsSync(icon2) && fs.readFileSync(icon2).equals(realPng),
+        'J.11 ...carrying the artwork bytes');
+    } finally { h2.cleanup(); }
+  }
+}
+
 const SECTIONS = [
   ['A', 'the start-up pass writes what is missing', sectionA],
   ['B', 'reconcile is idempotent', sectionB],
@@ -787,6 +1155,9 @@ const SECTIONS = [
   ['E', 'the entry content', sectionE],
   ['F', 'the entry and the launch path agree', sectionF],
   ['G', 'message hygiene', sectionG],
+  ['H', 'the icon ladder: fallback, candidates, favicons', sectionH],
+  ['I', 'reconcile upgrades stale Icon= entries', sectionI],
+  ['J', 'PWAManager.install keeps the same ladder', sectionJ],
 ];
 
 async function step(n, name, fn) {

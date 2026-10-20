@@ -1,0 +1,27 @@
+Fix CMake 4 compatibility with old cmake_minimum_required() calls
+
+CMake 4 removed compatibility with CMake < 3.5, making plain
+cmake_minimum_required(VERSION <3.5) a hard error
+(https://bugs.gentoo.org/977266). Bump the minimums of the affected
+bundled CMake files. The kde/ thumbnailer module additionally gets
+3.16 to match the current ECM requirement.
+
+--- a/src/desktop/linux/kde/CMakeLists.txt
++++ b/src/desktop/linux/kde/CMakeLists.txt
+@@ -3,7 +3,7 @@
+ #
+ # Licensed under the the MIT License (https://opensource.org/licenses/MIT).
+ 
+-cmake_minimum_required(VERSION 2.8.12)
++cmake_minimum_required(VERSION 3.16)
+ set(QT_MIN_VERSION "5.2.0")
+ project(asepritethumbnail)
+ find_package(ECM REQUIRED NO_MODULE)
+--- a/third_party/IXWebSocket/third_party/cpp-linenoise/example/CMakeLists.txt
++++ b/third_party/IXWebSocket/third_party/cpp-linenoise/example/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 3.0)
++cmake_minimum_required(VERSION 3.5)
+ include_directories(.)
+ add_definitions("-std=c++1y")
+ 

@@ -1,0 +1,18 @@
+Don't install the bundled libarchive
+
+The bundled libarchive is built as a static convenience library for
+aseprite only. Disable its installation rules (libraries, headers,
+man pages) and the bsdunzip tool, which otherwise collide with the
+files installed by app-arch/libarchive.
+
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -145,6 +145,8 @@
+ set(ENABLE_CAT OFF CACHE BOOL "Enable cat building")
+ set(ENABLE_TAR OFF CACHE BOOL "Enable tar building")
+ set(ENABLE_CPIO OFF CACHE BOOL "Enable cpio building")
++set(ENABLE_UNZIP OFF CACHE BOOL "Enable unzip building")
++set(ENABLE_INSTALL OFF CACHE BOOL "Enable installing of libraries")
+ set(ENABLE_LIBB2 OFF CACHE BOOL "Enable the use of the system LIBB2 library if found")
+ set(ENABLE_ICONV OFF CACHE BOOL "Enable iconv support")
+ set(WINDOWS_VERSION "WS08" CACHE STRING "Set Windows Vista as the target version for compiling libarchive (Windows only)" FORCE)

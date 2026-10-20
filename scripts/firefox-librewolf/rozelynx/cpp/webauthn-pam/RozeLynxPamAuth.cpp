@@ -11,19 +11,15 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#pragma GCC visibility push(default)
 #include <security/pam_appl.h>
-#pragma GCC visibility pop
 
 #include "mozilla/JSONStringWriteFuncs.h"
 #include "mozilla/JSONWriter.h"
 #include "mozilla/Monitor.h"
 #include "mozilla/ScopeExit.h"
 #include "mozilla/Services.h"
-#include "mozilla/Span.h"
 #include "nsCOMPtr.h"
 #include "nsIObserverService.h"
-#include "nsISupportsImpl.h"
 #include "nsIThread.h"
 #include "nsLiteralString.h"
 #include "nsString.h"
@@ -55,19 +51,11 @@ bool PamServiceFileExists(const char* aService) {
   return false;
 }
 
-class RozeLynxPamVerifier;
-
-// The WebAuthn service drives at most one PAM transaction at a time.
-RozeLynxPamVerifier* gActive = nullptr;
-
 class RozeLynxPamVerifier final {
-  // Note: qualified - an unqualified friend declaration inside this
-  // anonymous namespace would introduce a distinct phantom class
-  // instead of friending mozilla::dom::RozeLynxPamAuth.
-  friend class ::mozilla::dom::RozeLynxPamAuth;
+  friend class RozeLynxPamAuth;
 
  public:
-  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RozeLynxPamVerifier)
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING
 
   // Main thread. Returns false when the thread could not be created; the
   // callback is invoked (with aVerified = false) either way exactly once.
@@ -255,7 +243,6 @@ class RozeLynxPamVerifier final {
     }
   }
 
-
   // Main thread. Fires the JSON "webauthn-prompt" observer notification
   // consumed by toolkit/modules/WebAuthnPromptHelper.sys.mjs.
   void SendPrompt(const char* aType) {
@@ -264,16 +251,16 @@ class RozeLynxPamVerifier final {
     JSONWriter w(f, JSONWriter::CollectionStyle::SingleLineStyle);
     w.Start();
     w.StartObjectProperty("prompt");
-    w.StringProperty("type", MakeStringSpan(aType));
+    w.StringProperty("type", aType);
     w.EndObject();
-    NS_ConvertUTF16toUTF8 originUtf8(mOrigin);
-    w.StringProperty("origin", MakeStringSpan(originUtf8.get()));
+    nsAutoCString originUtf8(NS_ConvertUTF16toUTF8(mOrigin));
+    w.StringProperty("origin", originUtf8.get());
     w.IntProperty("tid", static_cast<int64_t>(mTransactionId));
     w.IntProperty("browsingContextId",
                   static_cast<int64_t>(mBrowsingContextId));
     w.End();
 
-    NS_ConvertUTF8toUTF16 wide(json);
+    nsString wide(NS_ConvertUTF8toUTF16(json));
     nsCOMPtr<nsIObserverService> os = services::GetObserverService();
     if (os) {
       MOZ_ALWAYS_SUCCEEDS(
@@ -296,6 +283,9 @@ class RozeLynxPamVerifier final {
   bool mWaitingForPassword = false;
   bool mCancelled = false;
 };
+
+// The WebAuthn service drives at most one PAM transaction at a time.
+RozeLynxPamVerifier* gActive = nullptr;
 
 }  // namespace
 

@@ -1,0 +1,17 @@
+Fix linking with system tinyxml2 when TinyEXIF is bundled
+
+third_party/TinyEXIF links the tinyxml2::tinyxml2 target, which only
+exists once tinyxml2 has been found with find_package() (or after its
+bundled add_subdirectory()). With USE_SHARED_TINYXML=ON this call was
+missing and configuration failed.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -269,6 +269,7 @@
+ if(USE_SHARED_TINYXML)
+   find_library(TINYXML_LIBRARY NAMES tinyxml2)
+   find_path(TINYXML_INCLUDE_DIR NAMES tinyxml2.h)
++  find_package(tinyxml2 REQUIRED)
+ else()
+   set(TINYXML_LIBRARY tinyxml2)
+   set(TINYXML_INCLUDE_DIR ${TINYXML_DIR})

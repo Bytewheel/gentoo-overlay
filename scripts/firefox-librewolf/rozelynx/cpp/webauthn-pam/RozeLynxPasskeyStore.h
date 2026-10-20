@@ -6,6 +6,7 @@
 #define mozilla_dom_RozeLynxPasskeyStore_h_
 
 #include <cstdint>
+#include "nsCString.h"
 #include "nsString.h"
 #include "nsTArray.h"
 

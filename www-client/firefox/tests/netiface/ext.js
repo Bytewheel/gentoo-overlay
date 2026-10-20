@@ -181,6 +181,189 @@ function makeService(opts = {}) {
   return svc;
 }
 
+// ── the schema layer, modelled from Schemas.sys.mjs ───────────────
+// Firefox validates experiment-API arguments against the schema JSON
+// before the implementation runs, and this vm has no such layer - the
+// stubs below called the implementation directly, which is why the
+// schema could disagree with the code and no check noticed.
+//
+// The rule that matters here is ObjectType.normalize in
+// Schemas.sys.mjs: for an object type, any property the schema does not
+// declare produces "Unexpected property" and rejects the WHOLE call,
+// unless the schema carries "additionalProperties". getUrlRules()
+// returns records with an extra `index` field, so the contract the
+// editor depends on is that a row may be echoed straight back into
+// setUrlRules. The user-visible failure this guards: the first add
+// works (the list was empty), and every later one died in validation
+// with the echoed row's index field - one rule was the hard cap.
+// ── the schema PARSER, modelled from RootType.parseSchema ────────
+// The load-time half of the schema layer, which this harness had no
+// model of at all: RootType.parseSchema resolves a schema object's
+// "type" through the TYPES table - a schema with no "type", "$ref" or
+// "choices" is TYPES[undefined], and `type.parseSchema(...)` on that
+// THROWS, killing the whole extension as it loads. The 1.0.75
+// regression was exactly that: setUrlRules gained
+// "additionalProperties": {} (type-less), the normalize half of this
+// harness accepted the key's mere presence, and the shipped extension
+// died at load - no background page, so no chip (onShutdown had torn
+// them down for the update), no context menu, no netiface at all.
+// ObjectType.parseSchema accepts for additionalProperties: `true`
+// (rewritten to {type:"any"}) or a schema with a resolvable type -
+// the house form is { "type": "any" } (prefs-schema.json).
+const SCHEMA_TYPES = new Set([
+  'any', 'array', 'boolean', 'function', 'integer', 'null', 'number',
+  'object', 'string',
+]);
+const TYPE_SCHEMA_MARKERS = [
+  'type', '$ref', 'choices', 'enum', 'optional', 'items', 'properties',
+  'additionalProperties', 'patternProperties', 'minItems', 'maxItems',
+  'minLength', 'maxLength', 'pattern', 'format',
+];
+
+const SCHEMA_VALUED_KEYS = ['items', 'additionalProperties'];
+
+function typeSchemaParses(value, path, errs) {
+  // value IS a type schema by construction: it was reached through a
+  // schema-valued position (items, additionalProperties, a properties
+  // entry, a parameter entry), so there is no "does this look like a
+  // schema" question to ask - the parser hands it straight to
+  // RootType.parseSchema, and a type-less object (the shipped
+  // "additionalProperties": {}) is TYPES[undefined], which throws and
+  // fails the whole extension load.
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => typeSchemaParses(v, `${path}[${i}]`, errs));
+    return;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return;  // e.g. "additionalProperties": true - the parser rewrites it.
+  }
+  if ('choices' in value) {
+    typeSchemaParses(value.choices, `${path}.choices`, errs);
+  } else if ('$ref' in value) {
+    // Resolved against the namespace by RefType.
+  } else if (!('type' in value)) {
+    errs.push(`${path}: type schema with no "type", "$ref" or ` +
+      `"choices" - RootType.parseSchema reads TYPES[undefined] and ` +
+      `throws, which fails the whole extension load`);
+  } else if (!SCHEMA_TYPES.has(value.type)) {
+    errs.push(`${path}: unknown type "${value.type}"`);
+  }
+  for (const key of SCHEMA_VALUED_KEYS) {
+    if (key in value) {
+      typeSchemaParses(value[key], `${path}.${key}`, errs);
+    }
+  }
+  for (const key of ['properties', 'patternProperties']) {
+    // A name -> schema map: each VALUE is the schema, the map is not.
+    if (key in value) {
+      for (const [name, child] of Object.entries(value[key])) {
+        typeSchemaParses(child, `${path}.${key}.${name}`, errs);
+      }
+    }
+  }
+  // Everything else (parameters, events, default values, ...) is
+  // structural: walk it generically and let the marker heuristic there
+  // decide what is a schema.
+  for (const [key, child] of Object.entries(value)) {
+    if (!SCHEMA_VALUED_KEYS.includes(key) &&
+        key !== 'properties' && key !== 'patternProperties') {
+      schemaParseErrors(child, `${path}.${key}`, errs);
+    }
+  }
+}
+
+function schemaParseErrors(value, path, errs) {
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => schemaParseErrors(v, `${path}[${i}]`, errs));
+    return;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return;
+  }
+  if (TYPE_SCHEMA_MARKERS.some(k => k in value)) {
+    typeSchemaParses(value, path, errs);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (SCHEMA_VALUED_KEYS.includes(key)) {
+      typeSchemaParses(child, `${path}.${key}`, errs);
+    } else if (key === 'properties' || key === 'patternProperties') {
+      for (const [name, entry] of Object.entries(child)) {
+        typeSchemaParses(entry, `${path}.${key}.${name}`, errs);
+      }
+    } else {
+      schemaParseErrors(child, `${path}.${key}`, errs);
+    }
+  }
+}
+
+function extensionSchemasParse() {
+  const errs = [];
+  for (const f of fs.readdirSync(
+      path.join(SRC, EXT, 'lib/experiments'))) {
+    if (!f.endsWith('-schema.json')) {
+      continue;
+    }
+    try {
+      const schemas = JSON.parse(fs.readFileSync(
+        path.join(SRC, EXT, 'lib/experiments', f), 'utf8'));
+      schemaParseErrors(schemas, f, errs);
+    } catch (e) {
+      errs.push(`${f}: ${e.message}`);
+    }
+  }
+  return errs;
+}
+
+let gSetUrlRulesItems = null;
+function setUrlRulesItemSchema() {
+  if (!gSetUrlRulesItems) {
+    const schemas = JSON.parse(fs.readFileSync(
+      path.join(SRC, EXT, 'lib/experiments/netiface-schema.json'), 'utf8'));
+    const ns = schemas.find(e => e.namespace === 'rozelynxNetIface');
+    const fn = ns.functions.find(f => f.name === 'setUrlRules');
+    gSetUrlRulesItems = fn.parameters[0].items;
+  }
+  return gSetUrlRulesItems;
+}
+
+function schemaRejectsRow(row) {
+  const items = setUrlRulesItemSchema();
+  if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+    return 'Expected a plain JavaScript object';
+  }
+  const declared = new Set(Object.keys(items.properties || {}));
+  for (const key of Object.keys(row)) {
+    if (!declared.has(key) && !items.additionalProperties) {
+      return `Unexpected property "${key}"`;
+    }
+  }
+  for (const [key, type] of Object.entries(items.properties || {})) {
+    if (key in row) {
+      if (type.type === 'string' && typeof row[key] !== 'string') {
+        return `Property "${key}" must be a string`;
+      }
+      if (type.type === 'boolean' && typeof row[key] !== 'boolean') {
+        return `Property "${key}" must be a boolean`;
+      }
+    }
+  }
+  return null;
+}
+
+function schemaValidateSetUrlRules(rules) {
+  if (!Array.isArray(rules)) {
+    return 'Expected an array';
+  }
+  for (let i = 0; i < rules.length; i++) {
+    const err = schemaRejectsRow(rules[i]);
+    if (err) {
+      return `${i}: ${err}`;
+    }
+  }
+  return null;
+}
+
 // ── run the experiment API in a vm ────────────────────────────────
 function loadApi({ prefs, service, tabs }) {
   const listeners = [];
@@ -194,11 +377,19 @@ function loadApi({ prefs, service, tabs }) {
     ExtensionAPIPersistent: class { getAPI() { return {}; } },
     ExtensionAPI: class { getAPI() { return {}; } },
     ExtensionCommon: { EventManager: class { constructor() { this.api = () => () => {}; } } },
+    // ChromeUtils models the real experiment-sandbox global: the sandbox is
+    // built by ExtensionCommon.sys.mjs `_createExtGlobal`, which passes
+    // `wantGlobalProperties: ["ChromeUtils"]` - i.e. the plain WebIDL
+    // namespace, whose members are import/importESModule/defineESModuleGetters
+    // and friends, and NO `Services`. `Services` is assigned to the same
+    // sandbox as a global (right below), which is the only shape
+    // netiface-api.js may read it in: a stub that also carries
+    // ChromeUtils.Services would agree with the code under test and hide
+    // exactly this bug again (the api did `const { Services } = ChromeUtils;`,
+    // got `undefined`, and every Services.prefs call - the whole URL-rule
+    // editor - threw with "can't access property 'prefs', Services is
+    // undefined").
     ChromeUtils: {
-      // The API takes Services from ChromeUtils, not from the sandbox global
-      // (that is the real sandbox's shape: this.rozelynxNetIface.getAPI does
-      // `const { Services } = ChromeUtils;`).
-      Services: { prefs: prefs.prefs, wm: { getEnumerator: () => ({ hasMoreElements: () => false }) } },
       importESModule() {
         return {
           SessionStore: {
@@ -423,8 +614,22 @@ async function testApi() {
 // 2. the popup's rules editor
 // ──────────────────────────────────────────────────────────────────
 function editorBrowser({ service, prefs, store, tabs, noMessage }) {
+  // The popup talks to the API through the schema layer, so the editor
+  // legs get the same gate the real browser enforces - with it, a stub
+  // that echoes rows through setUrlRules could never have agreed with a
+  // schema that rejects them.
+  const api = Object.assign({}, service, {
+    setUrlRules(rules) {
+      const err = schemaValidateSetUrlRules(rules);
+      if (err) {
+        return Promise.reject(
+          new Error('Error processing setUrlRules.' + err));
+      }
+      return Promise.resolve(service.setUrlRules(rules));
+    },
+  });
   return {
-    rozelynxNetIface: service,
+    rozelynxNetIface: api,
     tabs: { query: () => Promise.resolve(tabs) },
     storage: {
       local: {
@@ -445,6 +650,45 @@ function editorBrowser({ service, prefs, store, tabs, noMessage }) {
 }
 
 async function testEditor() {
+  // The pin: rows echoed straight back from getUrlRules() - index field
+  // and all - must validate against the REAL schema, because the editor
+  // clones what it renders. Pre-fix this was the whole bug: index made
+  // every call after the first fail validation in the real browser,
+  // and the vm had no schema layer to notice.
+  const pinErr = schemaValidateSetUrlRules([
+    { index: 0, pattern: '*.echoed.test', iface: 'wlan0', enabled: true },
+    { pattern: 'fresh.test', iface: '', enabled: false },
+  ]);
+  check(pinErr === null,
+    'the setUrlRules schema accepts a row echoed from getUrlRules()' +
+    (pinErr ? ' (' + pinErr + ')' : ''));
+
+  // The parser half: every schema file in the extension must survive
+  // RootType.parseSchema. This is the check whose absence shipped
+  // 1.0.75: a type-less "additionalProperties": {} killed the whole
+  // extension at load, and the vm harness - which modelled only the
+  // normalizer - reported 101 green.
+  {
+    const errs = extensionSchemasParse();
+    check(errs.length === 0,
+      'every experiment schema file parses like RootType.parseSchema' +
+      (errs.length ? ' (' + errs.slice(0, 3).join('; ') + ')' : ''));
+  }
+
+  // The site button must live OUTSIDE the empty-state block in the real
+  // markup: urlrules-empty is hidden as soon as any rule exists, and the
+  // button used to vanish with it - unreachable exactly when it is most
+  // wanted, with the manual row as the only way to add the second rule.
+  {
+    const html = fs.readFileSync(
+      path.join(SRC, EXT, 'modules/qr-code/popup.html'), 'utf8');
+    const emptyStart = html.indexOf('<div class="urlrules-empty"');
+    const emptyEnd = html.indexOf('</div>', emptyStart);
+    const btn = html.indexOf('id="urlrules-add-current"');
+    check(emptyStart !== -1 && btn !== -1 && btn > emptyEnd,
+      'the add-current button sits outside the empty-state block');
+  }
+
   const service = makeService({ layer: 'url', iface: 'wlan0' });
   service.getEffective = () => Promise.resolve({ iface: 'wlan0', layer: 'url' });
   service.getUrlRules = () => Promise.resolve({
@@ -589,7 +833,16 @@ async function testEditor() {
   const svc2 = makeService({ layer: 'url' });
   svc2.getEffective = () => Promise.resolve({ iface: 'wlan0', layer: 'url' });
   svc2.getUrlRules = () => Promise.resolve({ enabled: true, rules: [] });
-  svc2.setUrlRules = (rules) => Promise.resolve({ ok: true, enabled: true, rules });
+  // Echo like the REAL implementation does: the re-read records carry
+  // an index field (readUrlRules builds {index, pattern, iface,
+  // enabled}), which is what the editor clones on the next write.
+  svc2.setUrlRules = (rules) => {
+    svc2.written = rules;
+    return Promise.resolve({
+      ok: true, enabled: true,
+      rules: rules.map((r, i) => Object.assign({ index: i }, r)),
+    });
+  };
   loadScript(EXT + 'modules/netiface/urlrules-ui.js', dom2,
     editorBrowser({ service: svc2, prefs: makePrefs(), store: {},
       tabs: [{ id: 7, url: 'https://a.test/' }], noMessage: true }));
@@ -605,6 +858,29 @@ async function testEditor() {
   eq(dom2.byId('urlrules-status').textContent, '', 'no error is shown');
   eq(dom2.byId('urlrules-empty').hidden, true,
     'the empty state disappears once a rule is added');
+
+  // THE one-rule trap: the second add clones the row that came back from
+  // the first write. Pre-fix the clone carried the echoed index field
+  // and the schema gate (above) rejected the whole call - the input
+  // cleared, nothing was written, and the status stayed empty because
+  // the editor cleared it before writing.
+  dom2.byId('urlrules-new-pattern').value = 'second.test';
+  dom2.byId('urlrules-add-btn').dispatch('click');
+  await tick();
+  eq(svc2.written.length, 2,
+    'the SECOND add lands: ' + (dom2.byId('urlrules-status').textContent ||
+      'no error'));
+  eq(svc2.written[1].pattern, 'second.test', 'the second row is the new rule');
+  check(svc2.written.every(r => !('index' in r)),
+    'rows written back never carry the echoed index field');
+  eq(dom2.byId('urlrules-status').textContent, '',
+    'the second add shows no error');
+  // The site button stays reachable with rules present: it used to live
+  // inside the empty-state block, which hides as soon as a rule exists.
+  dom2.byId('urlrules-add-current').dispatch('click');
+  await tick();
+  eq(dom2.byId('urlrules-new-pattern').value, 'a.test',
+    'the site button still prefills with rules present (bare 2-label host)');
 
   // A build with no netiface API at all: the section stays hidden.
   const dom3 = makeDom(['urlrules-section', 'urlrules-header', 'urlrules-chevron',

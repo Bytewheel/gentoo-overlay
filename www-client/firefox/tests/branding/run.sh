@@ -27,7 +27,23 @@ set -u -o pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG="$(cd "${HERE}/../.." && pwd)"
-EBUILD="${RZ_EBUILD:-${PKG}/firefox-156.0.1.ebuild}"
+# The default subject is the 156.0.1 branding block, whichever REVISION the
+# tree names it by. The overlay once carried it as firefox-156.0.1.ebuild and
+# revbumped to firefox-156.0.1-r1.ebuild - the branding block itself is
+# byte-identical either way, being generated from the same template - so a
+# default that named only the un-revbumped file went FATAL the day the rename
+# landed, and a leg that cannot find its subject is worse than one that skips
+# it loudly. Plain name first, then the newest -rN, matching what an emerge
+# would actually read.
+EBUILD="${RZ_EBUILD:-}"
+if [ -z "${EBUILD}" ]; then
+	for _c in "${PKG}"/firefox-156.0.1.ebuild "${PKG}"/firefox-156.0.1-r*.ebuild; do
+		if [ -f "${_c}" ]; then
+			EBUILD="${_c}"
+			break
+		fi
+	done
+fi
 ROOT="${RZ_TEST_ROOT:-${PKG}/files/rozelynx}"
 # The ebuild's ${FILESDIR} is files/, and the block writes ${FILESDIR}/rozelynx/...
 # so it is the PARENT of the root, not the root. Getting this wrong makes every
@@ -40,8 +56,12 @@ FILESDIR="$(dirname "${ROOT}")"
 export FILESDIR
 CACHE="${RZ_SEED_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/rozelynx-test-seed}"
 # The version whose upstream branding dir seeds the tree. It has to match the
-# ebuild under test, or the assertions are about a different Firefox.
+# ebuild under test, or the assertions are about a different Firefox. A
+# Gentoo revision suffix (-rN) is NOT part of the version: the seed and the
+# distfile are keyed by PV, and a revbump does not change the branding block,
+# so the suffix is stripped rather than looked up.
 SEED_PV="$(basename "${EBUILD}" | sed -n 's/^firefox-\(.*\)\.ebuild$/\1/p')"
+SEED_PV="${SEED_PV%%-r*}"
 DISTFILE="${RZ_DISTFILE:-/var/cache/distfiles/firefox-${SEED_PV}.source.tar.xz}"
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }

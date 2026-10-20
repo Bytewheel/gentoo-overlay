@@ -24,6 +24,9 @@
  *   8  window resolution: the route Gecko itself uses, and no sandbox QI
  *   9  hasDesktopEntry, the read half reconcile needs
  *  10  the schema and the implementation agree
+ *  11  the --ssb handler probe reports
+ *  12  writeIconFile sniffs the payload, whatever the server called it
+ *  13  hasDesktopEntry reads the Icon= key back (v1.0.73)
  */
 
 const fs = require('fs');
@@ -414,6 +417,8 @@ const SECTIONS = [
   ['9', 'hasDesktopEntry', section9],
   ['10', 'schema and implementation agree', section10],
   ['11', 'the --ssb handler probe reports', section11],
+  ['12', 'writeIconFile sniffs the payload', section12],
+  ['13', 'hasDesktopEntry reads the Icon= back', section13],
 ];
 
 /* 8 --------------------------------------------------------------- */
@@ -705,6 +710,7 @@ async function section9() {
   }
 }
 
+
 /* 10 -------------------------------------------------------------- */
 
 async function section10() {
@@ -838,6 +844,159 @@ async function section11() {
       ok(/classDescription threw/.test(r.classDescription || ''),
         '11.13 ...and says that is what happened', r.classDescription);
     });
+  }
+}
+
+
+/* 12 -------------------------------------------------------------- */
+
+/* The declared media type is whatever a server said, and servers say
+ * application/octet-stream to perfectly good PNGs. 1.0.72's writer refused
+ * exactly that payload and the caller's entry fell back to the theme-name
+ * icon, so the fix this section exists for is: the EXTENSION comes from the
+ * bytes, the declaration only names the refusal. */
+async function section12() {
+  const { sb, api } = fresh();
+  const icons = path.join(sb.profd, 'pwa-icons');
+
+  // Real signatures, because the point is that a *recognisable* payload
+  // survives a lying Content-Type. A fake signature that the sniff would
+  // only match because it was invented for the check is the fake agreeing
+  // with the code again.
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const r = await api.writeIconFile(
+    'data:application/octet-stream;base64,' + png.toString('base64'), 'pwa-a');
+  ok(r.ok, '12.1 a PNG served as octet-stream is written', JSON.stringify(r));
+  ok(r.path.endsWith('.png'), '12.2 ...under a .png name', r.path);
+  ok(fs.readFileSync(path.join(icons, 'pwa-a.png')).equals(png),
+    '12.3 ...with the bytes intact');
+
+  const webp = Buffer.alloc(12);
+  webp.write('RIFF', 0, 'ascii');   // bytes 0-3: 'RIFF'
+  webp.write('WEBP', 8, 'ascii');    // bytes 8-11: 'WEBP' (VP8 in 12..)
+  const w = await api.writeIconFile(
+    'data:text/plain;base64,' + webp.toString('base64'), 'pwa-b');
+  ok(w.ok && w.path.endsWith('.webp'),
+    '12.4 a WEBP sniffed through a text/plain declaration', JSON.stringify(w));
+
+  const ico = Buffer.from([0x00, 0x00, 0x01, 0x00]);
+  const i = await api.writeIconFile(
+    'data:application/octet-stream;base64,' + ico.toString('base64'), 'pwa-c');
+  ok(i.ok && i.path.endsWith('.ico'),
+    '12.5 an ICO is sniffed by its 00 00 01 00 prefix', JSON.stringify(i));
+
+  const bmp = Buffer.alloc(2);
+  bmp.write('BM', 0, 'ascii');
+  const bm = await api.writeIconFile(
+    'data:application/octet-stream;base64,' + bmp.toString('base64'), 'pwa-d');
+  ok(bm.ok && bm.path.endsWith('.bmp'),
+    '12.6 a BMP is sniffed by its "BM"', JSON.stringify(bm));
+
+  // SVG is the one text format: an XML prolog precedes the <svg, and the
+  // sniff tolerates exactly that shape - no whitespace-only file with the
+  // word svg in it.
+  const svg = Buffer.from('<?xml version="1.0"?><svg xmlns="…"/>');
+  const s = await api.writeIconFile(
+    'data:application/octet-stream;base64,' + svg.toString('base64'), 'pwa-e');
+  ok(s.ok && s.path.endsWith('.svg'),
+    '12.7 an SVG is sniffed as text naming an <svg>', JSON.stringify(s));
+
+  // Both legs failing is still a refusal, with the declared type in the
+  // reason: the sniff must not turn the writer into "write anything".
+  const junk = await api.writeIconFile(
+    'data:application/octet-stream;base64,' + Buffer.from('not an image at all')
+      .toString('base64'), 'pwa-f');
+  eq(junk.ok, false, '12.8 bytes nobody recognises are refused');
+  ok(/octet-stream/.test(junk.error || ''),
+    '12.9 ...and the reason names what was declared', junk.error);
+  eq((await api.writeIconFile(
+    'data:text/html;base64,' + Buffer.from('<html><body>x</body></html>')
+      .toString('base64'), 'pwa-g')).ok, false,
+    '12.10 an HTML payload is not adopted as an icon by the sniff');
+}
+
+/* 13 -------------------------------------------------------------- */
+
+/* The read half's second answer. The reconcile pass decides "present" vs
+ * "upgrade" on exactly what this section asserts: the Icon= value, and
+ * whether an absolute Icon= file is still there. */
+async function section13() {
+  const entry = [
+    '[Desktop Entry]',
+    'Type=Application',
+    'Name=Demo',
+    'Exec=rozelynx --ssb https://x/',
+    'Icon=%ICON%',
+    '',
+  ].join('\n');
+  const { sb, api } = fresh();
+  const apps = path.join(sb.home, '.local/share/applications');
+
+  const w = await api.writeDesktopEntry('a.desktop',
+    entry.replace('%ICON%', '/tmp/rz-no-such-icon.png'));
+  ok(w.ok, '13.1 the entry writes', JSON.stringify(w));
+  const h = await api.hasDesktopEntry('a.desktop');
+  ok(h.ok && h.exists, '13.2 it is there', JSON.stringify(h));
+  eq(h.icon, '/tmp/rz-no-such-icon.png',
+    '13.3 the Icon= value is read back');
+  eq(h.iconExists, false, '13.4 an absolute value is stat-ed, and is absent');
+
+  // A theme NAME is not stat-ed: the DE resolves it, not the sandbox, so
+  // the reply carries the value and no iconExists at all - which is the
+  // distinction reconcile's "cannot be known" answer is built on.
+  {
+    const wb = await api.writeDesktopEntry('b.desktop',
+      entry.replace('%ICON%', 'rozelynx'));
+    ok(wb.ok, '13.5 the theme-name entry writes', JSON.stringify(wb));
+    const h2 = await api.hasDesktopEntry('b.desktop');
+    eq(h2.icon, 'rozelynx', '13.6 the theme NAME is reported as the value itself');
+    eq('iconExists' in h2, false,
+      '13.7 ...and is not stat-ed, so no iconExists field exists');
+  }
+
+  // A real file on the other side of the Icon= key.
+  {
+    const iconPath = path.join(scratch, 'live-icon.png');
+    fs.writeFileSync(iconPath, Buffer.from([0x89, 0x50]));
+    await api.writeDesktopEntry('c.desktop', entry.replace('%ICON%', iconPath));
+    const h3 = await api.hasDesktopEntry('c.desktop');
+    eq(h3.icon, iconPath, '13.8 a live absolute path round-trips');
+    eq(h3.iconExists, true, '13.9 ...and is reported present');
+  }
+
+  // An entry with no Icon= key at all: an empty answer, not a throw.
+  {
+    await api.writeDesktopEntry('d.desktop', '[Desktop Entry]\nType=Application\n');
+    const h4 = await api.hasDesktopEntry('d.desktop');
+    eq(h4.exists, true, '13.10 an entry without Icon= is still an entry');
+    eq(h4.icon, '', '13.11 ...whose read-back is an empty icon');
+  }
+
+  // The cap: a file at an entry's path that is not an entry must not be
+  // dragged through a string, it must answer "cannot be known" (no fields)
+  // while still answering the primary question.
+  {
+    const name = await api.writeDesktopEntry('e.desktop', entry.replace('%ICON%', 'x'))
+      .then(r => r.name);
+    const p = path.join(apps, name);
+    fs.writeFileSync(p, Buffer.alloc((1 << 20) + 16, 0x41));
+    const h5 = await api.hasDesktopEntry('e.desktop');
+    ok(h5.ok && h5.exists, '13.12 an oversized file at the path is still there',
+      JSON.stringify(h5));
+    eq('icon' in h5, false, '13.13 ...and reports no icon field');
+    eq('iconExists' in h5, false, '13.14 ...and no iconExists either');
+  }
+
+  // XDG_DATA_HOME is honoured by the read too (9.16 asserts the pre-1.0.73
+  // half; this is the same rule through the new fields).
+  {
+    const probe = '/tmp/rz-xdg-has13-' + process.pid;
+    fs.rmSync(probe, { recursive: true, force: true });
+    const x = fresh({ env: { XDG_DATA_HOME: probe } });
+    await x.api.writeDesktopEntry('a.desktop', entry.replace('%ICON%', '/tmp/x.png'));
+    const hx = await x.api.hasDesktopEntry('a.desktop');
+    eq(hx.icon, '/tmp/x.png', '13.15 the read-back honours XDG_DATA_HOME');
+    fs.rmSync(probe, { recursive: true, force: true });
   }
 }
 

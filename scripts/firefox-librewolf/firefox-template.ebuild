@@ -1911,6 +1911,21 @@ PWAMOZ
 		eapply "${FILESDIR}/librewolf/ui-patches/remove-cfrprefs.patch"
 		eapply "${FILESDIR}/librewolf/urlbarprovider-interventions.patch"
 	fi
+	# Sponsored suggestions (Firefox Suggest AMP) default ON for several
+	# regions by a startup default-branch rewrite in QuickSuggest.sys.mjs, so
+	# the librewolf.cfg pref alone loses the race and the flag needs the source
+	# patch.  158+ carries the EU-157 spread in the table, 156 does not; 157
+	# and below-156 shapes are unverified, so the patch is skipped (the cfg
+	# lockPref still removes the ads) rather than risk src_prepare.
+	if use remove-sponsored; then
+		if ver_test ${PV} -ge 158.0; then
+			eapply "${FILESDIR}/librewolf/remove-sponsored-158.patch"
+		elif ver_test ${PV} -ge 156.0 && ver_test ${PV} -lt 157.0; then
+			eapply "${FILESDIR}/librewolf/remove-sponsored.patch"
+		else
+			ewarn "  remove-sponsored: no verified QuickSuggest patch shape for ${PV} - cfg lockPref only"
+		fi
+	fi
 	if use privacy-ui; then
 		eapply "${FILESDIR}/librewolf/ui-patches/privacy-preferences.patch"
 		eapply "${FILESDIR}/librewolf/ui-patches/hide-default-browser.patch"
@@ -2572,7 +2587,7 @@ SSBEOF
 				<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="474" height="474" viewBox="0 0 474 474">
 				  <image x="0" y="0" width="474" height="474" preserveAspectRatio="xMidYMid meet" xlink:href="data:image/png;base64,${rozelynx_theme_b64}"/>
 				</svg>
-				ROZELYNX_THEME_ICON
+			ROZELYNX_THEME_ICON
 			insinto /usr/share/icons/hicolor/scalable/apps
 			newins "${T}/rozelynx-theme.svg" rozelynx.svg
 			einfo "  scalable theme icon: branding/paw.png (replaces the old rose vector)"

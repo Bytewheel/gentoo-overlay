@@ -1,0 +1,63 @@
+Use system libjpeg-turbo/libwebp when Skia is compiled from sources
+
+Upstream assumes a precompiled Skia package whose out/ directory
+contains libjpeg.a/libwebp.a and whose source tree ships the
+third_party/externals headers. The Gentoo ebuild compiles Skia from
+sources with is_official_build=true, which makes the aseprite/skia
+fork link the system libjpeg/libwebp/libpng/zlib instead, so neither
+the libraries nor the externals directories exist at configure time.
+With CMake 4 the non-existent INTERFACE_INCLUDE_DIRECTORIES then fail
+the generation step. Fall back to the system libraries.
+
+--- a/cmake/FindJpegTurbo.cmake
++++ b/cmake/FindJpegTurbo.cmake
+@@ -11,7 +11,18 @@
+ 
+   find_library(LIBJPEG_TURBO_LIBRARY NAMES libjpeg jpeg
+     HINTS "${SKIA_LIBRARY_DIR}" NO_DEFAULT_PATH)
+-  set(LIBJPEG_TURBO_INCLUDE_DIRS "${SKIA_DIR}/third_party/externals/libjpeg-turbo")
++
++  if(LIBJPEG_TURBO_LIBRARY)
++    set(LIBJPEG_TURBO_INCLUDE_DIRS "${SKIA_DIR}/third_party/externals/libjpeg-turbo")
++  else()
++    # Fall back to the system libjpeg-turbo (e.g. when Skia is compiled
++    # from sources instead of using a precompiled package).
++    find_library(LIBJPEG_TURBO_LIBRARY NAMES libjpeg jpeg)
++    find_path(LIBJPEG_TURBO_INCLUDE_DIRS NAMES jpeglib.h)
++    if(NOT LIBJPEG_TURBO_LIBRARY OR NOT LIBJPEG_TURBO_INCLUDE_DIRS)
++      message(FATAL_ERROR "Could not find libjpeg-turbo")
++    endif()
++  endif()
+ 
+   add_library(libjpeg-turbo STATIC IMPORTED)
+   set_target_properties(libjpeg-turbo PROPERTIES
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -375,11 +375,25 @@
+     find_library(WEBP_LIBRARIES webp
+       NAMES libwebp # required for Windows
+       PATHS "${SKIA_LIBRARY_DIR}" NO_DEFAULT_PATH)
+-    set(WEBP_INCLUDE_DIR "${SKIA_DIR}/third_party/externals/libwebp/src")
++
+     if(WEBP_LIBRARIES)
++      set(WEBP_INCLUDE_DIR "${SKIA_DIR}/third_party/externals/libwebp/src")
+       set(WEBP_FOUND ON)
+     else()
+-      set(WEBP_FOUND OFF)
++      # Fall back to the system webp library (e.g. when Skia is compiled
++      # from sources instead of using a precompiled package).
++      find_library(WEBP_LIBRARY webp NAMES libwebp)
++      find_library(WEBP_DEMUX_LIBRARY webpdemux NAMES libwebpdemux)
++      find_library(WEBP_MUX_LIBRARY webpmux NAMES libwebpmux)
++      find_path(WEBP_INCLUDE_DIR NAMES webp/decode.h)
++      if(WEBP_LIBRARY AND WEBP_DEMUX_LIBRARY AND
++         WEBP_MUX_LIBRARY AND WEBP_INCLUDE_DIR)
++        set(WEBP_LIBRARIES ${WEBP_LIBRARY}
++          ${WEBP_DEMUX_LIBRARY} ${WEBP_MUX_LIBRARY})
++        set(WEBP_FOUND ON)
++      else()
++        set(WEBP_FOUND OFF)
++      endif()
+     endif()
+   else()
+     set(WEBP_FOUND ON)

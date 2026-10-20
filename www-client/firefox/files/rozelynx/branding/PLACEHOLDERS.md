@@ -249,12 +249,28 @@ Nova-theme support.
 
 | File | Used for | Notes |
 |---|---|---|
-| `main/full.png` | **nothing** — *dead since 156* | the ebuild used to render this to `content/newtab-background.png`; the identifier is gone from the 156 tree and `branding/*/content/jar.mn` has no entry for it, so no jar packaged it. 156's newtab background is the builtin addon's `--newtab-background-color` CSS variable, or a wallpaper the user picks (`browser.newtabpage.activity-stream.newtabWallpapers.wallpaper`, resolved over the Remote Settings collection `newtab-wallpapers-v2`). Neither path has a build-time branding slot. Kept as artwork. |
 | `main/no-text.png` | about/logo rasters + the two remaining slot placeholders | **landscape scene, 707x460**, not a mark — see below |
-| `dark/no-text.png` | `default{16,32,48,64,128}.png` | line-art icon, 454x448, ~24% mean alpha; effectively square, so the square crops are ~0px. No longer the private-browsing logo — that slot has its own artwork now. |
-| `light/no-text.png` | *not referenced* | see "dead images" below |
-| `main/wordmark.png`, `light/wordmark.png`, `dark/wordmark.png` | *not referenced* | see "dead images" below |
-| `favicon64.png` | *not referenced* | see "dead images" below |
+| `dark/no-text.png` | `default{16,32,48,64,128}.png` (pre-paw ladder) | line-art icon, 454x448, ~24% mean alpha; effectively square, so the square crops are ~0px. No longer the private-browsing logo — that slot has its own artwork now. |
+| `favicon64.png` | `default64.png` (the 64px ladder step) + `defaultFavicon.svg` | 38x35 paw mark; see "Raster artwork added 2026-09-30" below |
+
+### Deleted images — do not re-add these
+
+The old logo set was **deleted** from the overlay (and every mirror of it) as
+unused artwork on 2026-10-17. Nothing references them, so nothing regenerates
+them; if a future change wants one of these slots back, drop in *new* art
+rather than resurrecting these files:
+
+* **`{main,dark,light}/full.png`** — the 1408x768 wordmarked scene. Dead since
+  156: `content/newtab-background.png` had no reader (no `jar.mn` entry), and
+  the newtab background is now `newtab-background.png` (the same scene
+  without the wordmark) shipped via the `activity-stream.css` body rewrite.
+* **`{main,light,dark}/wordmark.png`** — the wordmark slots
+  (`about-wordmark.svg`, `firefox-wordmark.svg`) are filled from
+  `icon/rozelynx-wordmark.svg`, never from these PNGs.
+* **`light/no-text.png`** — 447x443 light-mode line art, never wired to a
+  slot; `dark/no-text.png` covers every slot it could have served.
+* **`c1.png`, `c2.png`** — 128x128 early logo candidates; never referenced
+  by the ebuild, the distro script or any patch.
 
 ### The finished illustrations in `vector/`
 
@@ -294,21 +310,16 @@ with a third of its height empty. The letterbox is correct for the 512x512
 raster. If a square source or a purpose-drawn mark is wanted, add one and change
 the source, not the flags.
 
-### Dead images — do not "fix" these
+### Dead images — deleted, not parked
 
-* **`{main,light,dark}/wordmark.png`** — the wordmark slots (`about-wordmark.svg`,
-  `firefox-wordmark.svg`) are filled from `icon/rozelynx-wordmark.svg`, not from
-  these PNGs, so the PNGs are inert. They are kept as the intended source for a
-  future wordmark vector, not as a packaging bug.
-* **`light/no-text.png`** — 447x443, the light-mode line art. Kept for
-  completeness; it is currently not wired to any slot. `dark/no-text.png` (454x448)
-  covers the same slots.
-* **`favicon64.png`** — 38x35, unreferenced. The 64px window icon is generated
-  from `dark/no-text.png` (`default64.png`), so this file only matters if the
-  intent is the *favicon64* artwork specifically at 64px. The fallback favicon
-  for favicon-less pages is a separate vector slot
-  (`toolkit/themes/shared/icons/defaultFavicon.svg`) which is already replaced with
-  `icon/rozelynx.svg`.
+The section previously listing `{main,light,dark}/wordmark.png`,
+`light/no-text.png` and `favicon64.png` as "kept" artwork was folded into
+"Deleted images" above: the wordmarks and light line art were deleted, and
+`favicon64.png` turned out to be *referenced* (the `default64.png` ladder
+step and the embedded `defaultFavicon.svg`), so it stays. Do not "fix" any
+of this by restoring files — the deletions are deliberate and verified
+against every reference in the ebuild, the distro script and the extension
+packaging.
 
 ### Raster artwork added 2026-09-30
 
@@ -340,8 +351,8 @@ ByteWheel marketing path, which no longer exists on this machine).
 
 This is the PWA fallback, and it is deliberately *not* wired through the
 hicolor theme: a generated `.desktop` entry used to fall back to
-`Icon=rozelynx`, and the theme's `scalable/apps/rozelynx.svg` slot is the
-**discontinued old logo** — so a PWA without a usable icon launched with
+`Icon=rozelynx`, and the theme's `scalable/apps/rozelynx.svg` slot used to be
+the **discontinued old logo** — so a PWA without a usable icon launched with
 the old logo in the launcher and the default mark in the taskbar. The
 extension (`modules/pwa/background.js`, v1.0.73) now materialises a *file*
 before ever emitting a theme name: the site icon, a stored candidate URL,
@@ -352,6 +363,19 @@ renders directly. The `rozelynx` theme name survives only as the last resort
 of a parent that cannot write files at all, and the extension's own
 `hasDesktopEntry` read-back lets the start-up reconcile pass *upgrade*
 entries an earlier version left on the theme name.
+
+**Theme-name fallback closed (2026-10-17).** The theme name itself no longer
+resolves to the discontinued logo: both the ebuild and the distro script now
+GENERATE `hicolor/scalable/apps/rozelynx.svg` from `branding/paw.png` (the
+same mark the `hicolor/<n>x<n>/apps/rozelynx.png` ladder carries), as a
+base64 `<image>` SVG — so the `.desktop`'s own `Icon=`, the notification
+badge and any last-resort PWA entry all render the current mark, and the
+scalable slot and the PNG ladder can no longer disagree. `icon/rozelynx.svg`
+(the rose) remains the *in-chrome* rebranding sweep source only — see
+"Current vector sources" below. A related field failure was found the same
+day: `<profile>/pwa-icons` created as a zero-byte *file* (not a directory)
+makes every `writeIconFile` rung in that profile fail, which pins its PWA
+entries to the theme-name fallback; the directory is what the ladder expects.
 
 Because the fallback rides inside the extension, no ebuild or distro-script
 change is involved: `assemble-extension.py` copies `icons/` wholesale, so

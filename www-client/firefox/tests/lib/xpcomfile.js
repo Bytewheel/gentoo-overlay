@@ -337,6 +337,118 @@ class FakeOutputStream {
   get PR_TRUNCATE() { return FakeOutputStream.PR_TRUNCATE; }
 }
 
+/* nsIFileInputStream, for the read-back hasDesktopEntry grew in 1.0.73.
+ * init() opens the file the way PR_Open does: a missing file throws
+ * NS_ERROR_FILE_NOT_FOUND (which is the reason the API's caller never sees
+ * one - it stats first), and a directory refuses to open for reading,
+ * because reading a directory is not a thing the entry parser wants to do
+ * half of. The flags are honoured rather than ignored - the API only ever
+ * passes PR_RDONLY (0x01), and a stream opened in some other mode is a
+ * bug somewhere, not a read that should silently work. */
+class FakeFileInputStream {
+  constructor(fs) {
+    this._fs = fs;
+    this._file = null;
+    this._buf = null;
+    this._offset = 0;
+  }
+
+  init(file, ioFlags, perms, behaviorFlags) {
+    if (this._file) {
+      throw new Error('NS_ERROR_ALREADY_INITIALIZED: init() twice');
+    }
+    if (!file || !file.exists()) {
+      throw new Error('NS_ERROR_FILE_NOT_FOUND: ' + (file && file.path));
+    }
+    if (file.isDirectory()) {
+      throw new Error('NS_ERROR_FAILURE: ' + file.path + ' is a directory');
+    }
+    if ((ioFlags & FakeOutputStream.PR_RDONLY) !== FakeOutputStream.PR_RDONLY) {
+      throw new Error('NS_ERROR_INVALID_ARG: ioFlags ' + ioFlags + ' is not PR_RDONLY');
+    }
+    this._file = file;
+    this._buf = this._fs.readFile(file.path);
+    this._offset = 0;
+  }
+
+  available() {
+    if (!this._file) {
+      throw new Error('NS_ERROR_NOT_INITIALIZED: available()');
+    }
+    if (this._closed) {
+      throw new Error('NS_BASE_STREAM_CLOSED');
+    }
+    return Math.max(0, this._buf.length - this._offset);
+  }
+
+  read(count) {
+    if (!this._file) {
+      throw new Error('NS_ERROR_NOT_INITIALIZED: read()');
+    }
+    if (this._closed) {
+      throw new Error('NS_BASE_STREAM_CLOSED');
+    }
+    const n = Math.min(count, this._buf.length - this._offset);
+    if (n <= 0) {
+      return '';
+    }
+    const out = this._buf.toString('binary').slice(this._offset, this._offset + n);
+    this._offset += n;
+    return out;
+  }
+
+  close() {
+    /* Idempotent, like nsFileInputStream::Close after a null mFD. */
+    this._closed = true;
+  }
+}
+
+/* nsIScriptableInputStream: the string-y face the API reads through.
+ * init() rejects a stream that is not what it says it is, available()
+ * forwards (so a closed underlying stream surfaces as a throw, which the
+ * API's read loop treats as end-of-stream), read() returns a binary string
+ * where charCodeAt is the byte - which is what an Icon= parser over ASCII
+ * needs - and close() closes the underlying stream too, which is what
+ * nsScriptableInputStream::Close does and what the API's finally relies on
+ * for exactly one close of each stream. */
+class FakeScriptableInputStream {
+  constructor() {
+    this._stream = null;
+  }
+
+  init(stream) {
+    if (this._stream) {
+      throw new Error('NS_ERROR_ALREADY_INITIALIZED: init() twice');
+    }
+    if (!stream || typeof stream.available !== 'function' ||
+        typeof stream.read !== 'function') {
+      throw new Error('NS_ERROR_INVALID_ARG: init(not a stream)');
+    }
+    this._stream = stream;
+  }
+
+  available() {
+    if (!this._stream) {
+      throw new Error('NS_ERROR_NOT_INITIALIZED: available()');
+    }
+    return this._stream.available();
+  }
+
+  read(count) {
+    if (!this._stream) {
+      throw new Error('NS_ERROR_NOT_INITIALIZED: read()');
+    }
+    return this._stream.read(count);
+  }
+
+  close() {
+    if (this._stream) {
+      this._stream.close();
+      this._stream = null;
+    }
+  }
+}
+
 /* A chrome browser window, modelled on what Gecko actually hands out.
  *
  * Two properties are load-bearing and both were got wrong in the real code:
@@ -443,6 +555,8 @@ function makeSandbox(opts) {
       DIRECTORY: undefined, // what the bare form evaluates to in the real thing
       CREATECREATE: undefined,
     },
+    nsIFileInputStream: { name: 'nsIFileInputStream' },
+    nsIScriptableInputStream: { name: 'nsIScriptableInputStream' },
     mozIDOMWindowProxy: { name: 'mozIDOMWindowProxy' },
   };
 
@@ -505,6 +619,16 @@ function makeSandbox(opts) {
         return new FakeOutputStream(fsys);
       },
     },
+    '@mozilla.org/network/file-input-stream;1': {
+      createInstance() {
+        return new FakeFileInputStream(fsys);
+      },
+    },
+    '@mozilla.org/scriptableinputstream;1': {
+      createInstance() {
+        return new FakeScriptableInputStream();
+      },
+    },
   };
 
   return { Services, Ci, Cc, fsys, home, profd, windows };
@@ -547,6 +671,8 @@ module.exports = {
   FakeNode,
   FakeFs,
   FakeOutputStream,
+  FakeFileInputStream,
+  FakeScriptableInputStream,
   FakeChromeWindow,
   FakeTaskbar,
   makeSandbox,
