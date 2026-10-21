@@ -48,7 +48,7 @@ MOZ_PV_DISTFILES="${MOZ_PV}${MOZ_PV_SUFFIX}"
 MOZ_P_DISTFILES="${MOZ_PN}-${MOZ_PV_DISTFILES}"
 
 inherit check-reqs desktop flag-o-matic gnome2-utils linux-info llvm-r1 multiprocessing \
-	optfeature pax-utils python-any-r1 readme.gentoo-r1 rust toolchain-funcs virtualx xdg
+	optfeature pam pax-utils python-any-r1 readme.gentoo-r1 rust toolchain-funcs virtualx xdg
 
 MOZ_SRC_BASE_URI="https://archive.mozilla.org/pub/${MOZ_PN}/releases/${MOZ_PV}"
 
@@ -76,7 +76,7 @@ IUSE="+clang dbus debug eme-free hardened hwaccel jack libproxy pgo pulseaudio s
 IUSE+=" +system-av1 +system-harfbuzz +system-icu +system-jpeg +system-libevent +system-libvpx"
 IUSE+=" system-pipewire system-png +system-webp test valgrind wayland wifi +X"
 
-IUSE+=" +gmp-autoupdate gnome-shell jpegxl +jumbo-build openh264 +telemetry wasm-sandbox"
+IUSE+=" +gmp-autoupdate gnome-shell +jumbo-build openh264 +telemetry wasm-sandbox"
 
 # LibreWolf-style privacy hardening USE flags (from parent ebuild):
 IUSE+=" remove-safebrowsing remove-pocket remove-password-manager"
@@ -99,12 +99,28 @@ IUSE+=" language-packs xdg-profile newtab-fixes"
 # lepton-skin:        Compact Lepton UI theme CSS
 # ip-protection:      IP protection privacy UI overrides
 # net-iface:         Per-tab / per-container / per-profile interface pinning
+# pam-passkeys:      Local WebAuthn passkeys whose user verification runs
+#                    through PAM - howdy face authentication first, the
+#                    account password as fallback (USB security keys keep
+#                    working; everything the local authenticator cannot
+#                    serve is forwarded to them)
 # download-handoff:  Hand downloads off to a configured download manager
 #                     (any extension that answers, any program on PATH, or
-#                     the built-in uGet integrator) before the save UI
+#                     the built-in uGet integrator) before the save UI.
+#                     BROWSER CODE since 158.0.3: the engine and the
+#                     Settings > General editor live in
+#                     uriloader/exthandler/rozelynx-handoff/, and the
+#                     extension carries only the ext:<id> relay module
+# user-agent:        User agent switcher: preset/raw global override and
+#                     per-URL rules (extension popup + options page)
+# sync:              Account-less state sync: the rozelynxsync:// magic
+#                     link scheme (browser engine) + the extension's
+#                     gather/encrypt/restore module
+# twofa:             RozeLynx 2FA: the separate two-factor extension
+#                     (TOTP/HOTP vault, otpauth:// capture, page autofill)
 IUSE+=" rozelynx rozelynx-debug chrome-web-store experiments external-browser"
 IUSE+=" i18n mouse-gestures qr-code pwa lepton-skin ip-protection net-iface"
-IUSE+=" download-handoff"
+IUSE+=" download-handoff user-agent sync twofa pam-passkeys"
 
 REQUIRED_USE="|| ( X wayland )
 	debug? ( !system-av1 )
@@ -122,7 +138,11 @@ REQUIRED_USE="|| ( X wayland )
 	ip-protection? ( rozelynx )
 	pwa? ( rozelynx )
  	net-iface? ( rozelynx )
+	pam-passkeys? ( rozelynx )
 	download-handoff? ( rozelynx )
+	user-agent? ( rozelynx )
+	sync? ( rozelynx )
+	twofa? ( rozelynx )
  "
 
 RESTRICT="!test? ( test )"
@@ -145,7 +165,7 @@ BDEPEND="${PYTHON_DEPS}
 	app-arch/zip
 	>=dev-util/cbindgen-0.29.4
 	rozelynx? ( media-gfx/imagemagick )
-	net-libs/nodejs
+	net-libs/nodejs[ssl]
 	virtual/pkgconfig
 	amd64? ( >=dev-lang/nasm-2.14 )
 	x86? ( >=dev-lang/nasm-2.14 )
@@ -164,7 +184,7 @@ COMMON_DEPEND="${FF_ONLY_DEPEND}
 	>=app-accessibility/at-spi2-core-2.46.0:2
 	dev-libs/glib:2
 	dev-libs/libffi:=
-	>=dev-libs/nss-3.125
+	>=dev-libs/nss-3.130
 	>=dev-libs/nspr-4.39
 	media-libs/alsa-lib
 	media-libs/fontconfig
@@ -181,6 +201,7 @@ COMMON_DEPEND="${FF_ONLY_DEPEND}
 	dbus? (
 		sys-apps/dbus
 	)
+	pam-passkeys? ( sys-libs/pam )
 	jack? ( virtual/jack )
 	pulseaudio? (
 		|| (
@@ -392,7 +413,12 @@ rozelynx_enabled_modules() {
 	use lepton-skin && modules+=( "lepton-skin" )
   use ip-protection && modules+=( "ip-protection" )
   use net-iface && modules+=( "net-iface" )
-  use download-handoff && modules+=( "download-handoff" )
+  # The hand-off ENGINE is browser code (the download-handoff flag wires
+  # the C++ module in src_prepare below); the extension module is the
+  # ext:<id> relay that delivers download messages to other extensions.
+  use download-handoff && modules+=( "handoff-relay" )
+  use user-agent && modules+=( "user-agent" )
+  use sync && modules+=( "sync" )
   echo "${modules[@]}"
 }
 
@@ -554,9 +580,6 @@ src_prepare() {
 		_lw_patch_ver=legacy
 	fi
 
-	if [[ ${use_lto} == "yes" ]]; then
-		rm -v "${WORKDIR}"/firefox-patches/*-LTO-Only-enable-LTO-*.patch || die
-	fi
 	if use elibc_glibc ; then
 		rm -v "${WORKDIR}"/firefox-patches/*bgo-748849-RUST_TARGET_override.patch || die
 		rm -v "${WORKDIR}"/firefox-patches/*bgo-967694-musl-prctrl-exception-on-musl.patch || die
@@ -616,12 +639,31 @@ src_prepare() {
 		# extension can enumerate and click other extensions' context menu
 		# items. Gated on rozelynx alone, NOT on mouse-gestures: the patch
 		# restricts both methods at runtime to the RozeLynx feature
-		# extension by id, and the only consumer (the mouse-gestures
-		# module's menus.js bridge) already degrades to ok:false/'noapi'
-		# when the API is missing. So carrying it unconditionally costs a
-		# build without mouse-gestures nothing but an uncalled method,
-		# while tying it to mouse-gestures makes the API's presence a
-		# function of a feature flag it has nothing to do with.
+		# extension by id, and the only consumer already degrades to
+		# ok:false with the reason when the API is missing or the call
+		# rejects. So carrying it unconditionally costs a build without
+		# mouse-gestures nothing but an uncalled method, while tying it to
+		# mouse-gestures makes the API's presence a function of a feature
+		# flag it has nothing to do with.
+		#
+		# The consumer is the mouse-gestures BACKGROUND script, via the
+		# extmenuQuery / extmenuTrigger actions. This comment used to name
+		# "the mouse-gestures module's menus.js bridge", which no longer
+		# exists: that was a moz-extension iframe injected into every page
+		# and removed in Part E, and it could never have worked anyway
+		# (browser.menus is addon_parent scoped). The name was left behind
+		# by the refactor and would have sent the next reader looking for a
+		# file that is not in the tree.
+		#
+		# Worth knowing when this misbehaves: the API is patched into the
+		# stock menus namespace, so there is no experiment_apis entry for it
+		# and its absence from the manifest says nothing about whether it
+		# exists. It reads Firefox's private gMenuMap, which is also why
+		# tests/ext-menus-patch.js asserts the patch's added code never
+		# reads .root - that getter constructs a root MenuItem and can throw
+		# for an extension with no gMenuMap entry, which emptied the whole
+		# section with only a generic "An unexpected error occurred" to show
+		# for it.
 		einfo "  Applying extension menus API patch ..."
 		eapply "${FILESDIR}/rozelynx/dev/ext-menus-rozelynx.patch" || die
 
@@ -679,6 +721,28 @@ src_prepare() {
 		# strings (unofficial builds are assumed to be nightly). Copy it
 		# to a RozeLynx-branded directory that src_configure selects via
 		# --with-branding=browser/branding/rozelynx.
+		# Pre-flight: every theme asset this ebuild rewrites must already exist in
+		# the source tree, or the matching `cat >` below dies mid-prepare with a bare
+		# "No such file or directory". Each path here was verified against the
+		# 156.0.1 distfile; upstream moves these between releases, so re-verify on bump.
+		local themepath
+		for themepath in \
+			toolkit/themes/shared/icons/defaultFavicon.svg \
+			browser/themes/shared/privatebrowsing/favicon.svg \
+			browser/themes/shared/identity-block/trustpanel-graphic-enabled.svg \
+			browser/themes/shared/identity-block/trustpanel-graphic-warning.svg \
+			browser/themes/shared/identity-block/trustpanel-graphic-disabled.svg \
+			browser/themes/shared/addons/extensions-panel-empty.svg \
+			browser/themes/shared/addons/extensions-panel-empty-onboarding.svg \
+			browser/themes/shared/fxa/avatar-fox.svg \
+			browser/themes/shared/fxa/avatar-fox-circle.svg \
+			toolkit/themes/shared/extensions/category-extensions.svg \
+			toolkit/components/satchel/megalist/content/icons/cpm-fox-illustration.svg \
+			browser/components/profiles/content/assets/plus.svg
+		do
+			[[ -e "${themepath}" ]] || die "upstream theme asset missing: ${themepath}"
+		done
+
 		einfo "  Creating browser/branding/rozelynx ..."
 		rm -rf browser/branding/rozelynx || die
 		cp -a browser/branding/unofficial browser/branding/rozelynx || die
@@ -748,7 +812,7 @@ src_prepare() {
 		# (proton/nova, switched on browser.nova.enabled) so the new UI cannot
 		# fall back to stock artwork.
 		#
-		# It is embedded rather than traced on purpose: tracing a 38x35 mark up
+		# It is embedded rather than traced on purpose: tracing the 474x474 paw up
 		# to vector invents curves that are not in the artwork, and this slot is
 		# displayed at 16px where nobody can see the difference, whereas the
 		# invented outline would be visible the moment anyone scales it up.
@@ -785,11 +849,147 @@ src_prepare() {
 				|| die "Failed to replace default favicon"
 		fi
 
+		# Canvas background while the user overrides page colours
+		# (Settings > Language and Appearance > Colors > "Override the
+		# colours specified by the pages": Always). Gecko then sets
+		# mUsePrefColors and ignores author colours, so every page paints
+		# flat on the override background colour -- background IMAGES are
+		# the one author declaration that survives, which is why the
+		# override-colours work kept landing on images. The UA sheet paints
+		# the shipped wallpaper on the canvas, so overridden pages read as
+		# the RozeLynx cat-on-clouds scene instead of flat white.
+		#
+		# The gate is prefers-contrast: PreferenceSheet::Load leaves it
+		# no-preference exactly while document colours are in use, and any
+		# other value means the override is on (or the OS requests high
+		# contrast, which also wants a calm background). Chrome documents
+		# skip the override entirely (mIsChrome), so browser chrome and
+		# about: pages are unaffected. The min-width guard keeps the
+		# wallpaper out of small embedded frames.
+		#
+		# html.css is the toolkit UA sheet, so the rule reaches all web
+		# content; the wallpaper itself is browser branding, resolved
+		# through the global chrome registry from either jar.
+		if [[ -f "${FILESDIR}/rozelynx/branding/newtab-background.png" ]]; then
+			cat >> layout/style/res/html.css <<-'ROZELYNX_OVERRIDE_BG'
+
+				/* RozeLynx: branded canvas background while page colours
+				   are overridden (see the ebuild for the gating rationale). */
+				@media (prefers-contrast) and (min-width: 400px) {
+				  html {
+				    background-image: url("chrome://branding/content/newtab-background.png");
+				    background-size: cover;
+				    background-repeat: no-repeat;
+				    background-attachment: fixed;
+				  }
+				}
+				ROZELYNX_OVERRIDE_BG
+			einfo "  override-colours canvas background appended to html.css"
+		else
+			ewarn "branding/newtab-background.png absent; overridden pages keep the flat override colour"
+		fi
+
+		# Newtab favicon (the tab-strip icon for the about:newtab page itself).
+		#
+		# This is a completely different slot from the one above. about:newtab does
+		# not use defaultFavicon.svg at all: browser.js maps it via gPageIcons to
+		#     "about:newtab": "chrome://branding/content/icon32.png"
+		# which browser/branding/*/content/jar.mn resolves to
+		#     content/branding/icon32.png   (../default32.png)
+		# i.e. the branding raster set, not the skin. Conflating the two is what put
+		# the wrong mark on the wrong surface before.
+		#
+		# The set is one PNG per size (16/22/24/32/48/64/128/256), and Gecko picks by
+		# requested size, so every size has to carry the same artwork or the tab icon
+		# changes appearance with zoom/DPI. They are generated from one scaled copy of
+		# branding/paw.png rather than committed as eight separate binaries.
+		#
+		# favicon64.png (38x35, non-square) stays on defaultFavicon.svg above -- that
+		# is the website/bookmark fallback. paw.png (474x474, square) is the newtab
+		# mark, but it shares the branding default*.png slots with the window icon
+		# and so is generated much later, as the last writer of those five files.
+		# See the "newtab favicon" block next to the chrome-icon generator.
+
+		# Private NEWTAB favicon: the claw, on about:newtab only.
+		#
+		# Scoped deliberately to about:newtab. A private window's other icon-less tabs
+		# (bookmarks, sites with no favicon) must keep the default mark -- the claw is
+		# a newtab signal, not a blanket "this window is private" badge.
+		#
+		# about:newtab resolves to icon32.png in a private window too, so a file swap
+		# cannot differ them; this has to be a CSS override in the profile's
+		# userChrome.css (see the host's chrome-skin action). tabs.css sets the tab
+		# icon with
+		#     .tabbrowser-tab > .tab-content > .tab-icon-image { content: <icon> }
+		# so the override re-points content: at the tab whose label is about:newtab,
+		# and only inside a private window.
+		local claw_png="${FILESDIR}/rozelynx/branding/claw.png"
+		local claw_svg="${FILESDIR}/rozelynx/branding/privateNewtabFavicon.svg"
+		if [[ ! -f "${claw_png}" || ! -f "${claw_svg}" ]]; then
+			ewarn "branding/claw.png or privateNewtabFavicon.svg absent; private newtab keeps the paw"
+		fi
+		# The artwork itself is installed next to the CSS that references it, in
+		# src_install: MOZILLA_FIVE_HOME is only exported at the top of that
+		# function, so an insinto here would expand to a relative path and drop
+		# the file into the build tree instead of the install prefix. That
+		# silently produced a browser with the CSS rule present and the SVG
+		# missing, which renders as no private newtab mark at all.
+
+		# URL-bar trust chip MODAL (the card that opens when the chip is clicked).
+		# This is NOT the padlock on the chip itself. Three separate sets of files are
+		# easy to confuse here; only the third is the modal:
+		#
+		#   trust-icon-{active,insecure}.svg   the small 16x16 padlock ON the chip
+		#   breach-alert-shield-*.svg          the Nova-era modal graphic
+		#   trustpanel-graphic-{enabled,warning,disabled}.svg   the legacy modal graphic
+		#
+		# controlcenter/panel.css selects the legacy one via a custom property keyed on
+		# the popup's tracking-protection attribute:
+		#   [tracking-protection="enabled"]  -> trustpanel-graphic-enabled.svg
+		#   [tracking-protection="warning"]  -> trustpanel-graphic-warning.svg
+		#   [tracking-protection="disabled"] -> trustpanel-graphic-disabled.svg
+		# and renders it at #trustpanel-graphic-image-legacy (80x80). The padlock
+		# (trust-icon-*) is deliberately left as stock artwork: replacing it is a
+		# different change, and it is not what the modal uses.
+		#
+		# The stock trio is a context-fill mask (panel.css sets fill/stroke properties
+		# and tints them per state). Embedding the raster drops that tinting by
+		# design -- the artwork carries its own colours. The 80x80 slot geometry is kept
+		# to match its consumer, and the 94x89 source is embedded at native size.
+		local panel_enabled="${FILESDIR}/rozelynx/branding/trustpanel-graphic-enabled.png"
+		local panel_warning="${FILESDIR}/rozelynx/branding/trustpanel-graphic-warning.png"
+		local panel_disabled="${FILESDIR}/rozelynx/branding/trustpanel-graphic-disabled.png"
+		if [[ -f "${panel_enabled}" && -f "${panel_warning}" && -f "${panel_disabled}" ]]; then
+			local slot src b64
+			for slot in trustpanel-graphic-enabled trustpanel-graphic-warning trustpanel-graphic-disabled; do
+				case ${slot} in
+					trustpanel-graphic-enabled) src="${panel_enabled}" ;;
+					trustpanel-graphic-warning) src="${panel_warning}" ;;
+					*) src="${panel_disabled}" ;;
+				esac
+				b64="$(base64 -w0 "${src}")" || die "Failed to encode ${src}"
+				cat > "browser/themes/shared/identity-block/${slot}.svg" <<-ROZELYNX_PANEL || die "Failed to write ${slot}"
+					<!-- RozeLynx: branding/${slot}.png embedded in the slot's SVG, replacing
+					     the stock shield for the matching tracking-protection state of the
+					     URL-bar trust panel. Context-fill tinting is intentionally dropped:
+					     the artwork carries its own colours. Slot geometry stays 100x100 to
+					     match #trustpanel-graphic-image-legacy. -->
+					<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 100 100" width="100" height="100">
+					  <image x="0" y="0" width="100" height="100" preserveAspectRatio="xMidYMid meet" xlink:href="data:image/png;base64,${b64}"/>
+					</svg>
+				ROZELYNX_PANEL
+				einfo "    ${slot}.svg: real raster artwork from branding/${slot}.png"
+			done
+		else
+			ewarn "branding/trustpanel-graphic-*.png absent; the trust panel keeps its stock shields"
+		fi
+
 		# --- Replace Firefox branding icons with RozeLynx branding ---
-		# Branding sources live in files/rozelynx/branding/{main,dark,light}/.
+		# Branding sources live in files/rozelynx/branding/{main,dark}/.
 		# Image 1 (main): cat-on-clouds — newtab background + largest branding.
-		# Image 2 (dark):  line-art icon  — dark-mode iconography (window icons, about:privatebrowsing).
-		# Image 3 (light): line-art icon  — light-mode iconography.
+		# Image 2 (dark):  line-art icon — dark-mode iconography (window icons,
+		# about:privatebrowsing placeholders). The light/ variant was deleted
+		# with the other unused logos; dark/no-text.png covers its slots.
 		local branding_src="${FILESDIR}/rozelynx/branding"
 		local branding_dir="browser/branding/rozelynx"
 
@@ -943,9 +1143,29 @@ See files/rozelynx/branding/PLACEHOLDERS.md. -->"
 		# so a non-square source centre-crops instead of letterboxing: this
 		# one is 38x35, so it loses about 8% of its width to the crop.
 		#
+		# NOTE: every one of these five is then overwritten by the paw.png block
+		# immediately below, since the newtab tab icon resolves to the same
+		# files. The favicon64-at-64 special case therefore only affects
+		# default22/24/256 in practice -- which this platform never packages.
+		# It is left in place rather than removed: it is the correct source for
+		# those slots should packaging change, and it documents the original
+		# intent of the window-icon ladder.
+		#
 		# Falls back to dark/no-text.png when the artwork is absent, so a
 		# tree without it still builds the same icon set it built before.
 		local favicon64_src="${branding_src}/favicon64.png"
+		#
+		# The newtab favicon (branding/paw.png) shares these slots: browser.js
+		# assigns about:newtab its icon from gPageIcons ->
+		# "chrome://branding/content/icon32.png" -> ../default32.png, so the
+		# same files that carry the window icon also carry the newtab tab icon.
+		# There is no separate newtab icon file in the branding set.
+		#
+		# Generating paw.png into these paths earlier in src_prepare did nothing:
+		# this loop runs later and overwrote every one of them. So paw is applied
+		# here, as the last writer. A previous version of this block also
+		# generated 22/24/256, which this ebuild never packages (see above) and
+		# which therefore only clobbered unread stock files.
 		for size in 16 32 48 64 128; do
 			local icon_src="${branding_src}/dark/no-text.png"
 			if [ "${size}" = 64 ] && [ -f "${favicon64_src}" ]; then
@@ -956,6 +1176,32 @@ See files/rozelynx/branding/PLACEHOLDERS.md. -->"
 				"${branding_dir}/default${size}.png" \
 				|| die "Failed to generate ${size}px chrome icon"
 		done
+
+		# The newtab favicon (branding/paw.png) shares these very slots: browser.js
+		# assigns about:newtab its icon from gPageIcons ->
+		# "chrome://branding/content/icon32.png" -> ../default32.png, so the same
+		# files carrying the window icon also carry the newtab tab icon. There is no
+		# separate newtab icon file in the branding set.
+		#
+		# This MUST come after the loop above. Generating paw.png into these paths
+		# earlier in src_prepare did nothing at all: the loop overwrote every one,
+		# which is why the bookmark mark changed but neither newtab mark did.
+		# Applied last, paw is the final writer for these five slots. Only the five
+		# packaged sizes are touched; 22/24/256 are not built on this platform.
+		local paw_src="${branding_src}/paw.png"
+		if [ -f "${paw_src}" ]; then
+			# paw.png is square (474x474), so "^" plus -extent is a no-op crop;
+			# the treatment matches the surrounding calls either way.
+			for size in 16 32 48 64 128; do
+				magick "${paw_src}" -background none \
+					-resize "${size}x${size}^" -gravity center -extent "${size}x${size}" \
+					"${branding_dir}/default${size}.png" \
+					|| die "Failed to generate ${size}px newtab favicon"
+			done
+			einfo "    newtab favicon: branding/paw.png -> default{16,32,48,64,128}.png"
+		else
+			ewarn "branding/paw.png absent; newtab favicon keeps the dark/no-text mark"
+		fi
 
 		# Vector source: keep the existing SVG (rose logo) — PNG cannot
 		# replace a true vector; the SVG is used for GNOME/DE integration.
@@ -1005,11 +1251,37 @@ See files/rozelynx/branding/PLACEHOLDERS.md. -->"
 		# used to cause. A real error message is worth more than a
 		# half-branded build.
 		mkdir -p "${branding_dir}/content" 2>/dev/null || true
+		# These three raster slots drive about:newtab and about:*, and unlike every
+		# vector slot in this file they had no drop-in: they were always
+		# regenerated from main/no-text.png. That matters because
+		# main/no-text.png is a full-bleed OPAQUE scene (mean alpha 1.0), so the
+		# generated 192x192 PNG is an opaque pale square. The newtab draws it
+		# through CSS as a 64px background-image, so a light content colour
+		# scheme leaves a luma-0.75 square on a luma-1.0 background and the
+		# RozeLynx mark reads as gone. -background none cannot help: it
+		# preserves alpha, it cannot invent it.
+		#
+		# Fixing that needs artwork with transparency and enough contrast to read
+		# on both a light and a dark background -- no CSS change can, because an
+		# opaque background-image hides the page behind it. So these slots accept
+		# a drop-in now, the same way the vector slots always have:
+		#   branding/vector/about-logo.png  -- the 1x and @2x and about.png art
+		# A vector of the same name still wins for about-logo.svg, which is a
+		# different destination. Until artwork is dropped in, the generated
+		# placeholder is unchanged, so a tree without it installs what it did.
+		local logo_raster_dropin="${branding_src}/vector/about-logo.png"
 		for f in about.png about-logo.png about-logo@2x.png; do
-			magick "${branding_src}/main/no-text.png" -background none \
-				-resize 192x192^ -gravity center -extent 192x192 \
-				"${branding_dir}/content/${f}" \
-				|| die "Failed to generate ${branding_dir}/content/${f}"
+			if [[ -f "${logo_raster_dropin}" ]]; then
+				magick "${logo_raster_dropin}" -background none \
+					-resize 192x192^ -gravity center -extent 192x192 \
+					"${branding_dir}/content/${f}" \
+					|| die "Failed to install ${logo_raster_dropin} as content/${f}"
+			else
+				magick "${branding_src}/main/no-text.png" -background none \
+					-resize 192x192^ -gravity center -extent 192x192 \
+					"${branding_dir}/content/${f}" \
+					|| die "Failed to generate ${branding_dir}/content/${f}"
+			fi
 		done
 		magick "${branding_src}/main/no-text.png" -background none \
 			-resize 192x192^ -gravity center -extent 192x192 \
@@ -1038,18 +1310,267 @@ See files/rozelynx/branding/PLACEHOLDERS.md. -->"
 				|| die "Failed to generate ${branding_dir}/content/${f}"
 		done
 
+		# Newtab wallpaper. branding/newtab-background.png (the cat-on-clouds
+		# scene WITHOUT the wordmark -- branding/main/no-text.png; the wordmark
+		# is a separate element beside the 96px logo, so the background must not
+		# carry text) is the RozeLynx newtab background
+		# and had no way in: the newtab paints
+		#     body { background-image: var(--newtab-wallpaper, ""),
+		#                        linear-gradient(to right, var(--newtab-wallpaper-color, ""), ...) }
+		# and --newtab-wallpaper is assigned at RUNTIME from the Remote Settings
+		# "newtab-wallpapers-v2" catalogue (activity-stream.bundle.js), so there is
+		# no build-time slot that can populate it. Branding it by editing that
+		# Mozilla-maintained catalogue, or by picking the gradient colour, is not a
+		# build-time decision.
+		#
+		# So the body rule is rewritten directly, with the shipped art inlined as a
+		# chrome:// URL. The wallpaper wins over the gradient when set, so
+		# --newtab-wallpaper-color keeps working for users who pick a colour with
+		# no wallpaper; only the image layer is replaced. The rule is appended after
+		# upstream's body block so source order settles it, with equal specificity
+		# (body) rather than !important.
+		#
+		# Override-colors is what made this visible: it forces
+		# --newtab-background-color and the surrounding palette, which left a flat
+		# colour where the RozeLynx art should be. Both stylesheets get it.
+		local newtab_bg="${FILESDIR}/rozelynx/branding/newtab-background.png"
+		if [[ -f "${newtab_bg}" ]]; then
+			cp "${newtab_bg}" "${branding_dir}/content/newtab-background.png" \
+				|| die "Failed to install the newtab wallpaper"
+			# jar.mn is a strict ALLOWLIST: a file that is not listed there is
+			# silently dropped from browser.jar, with no warning. So dropping art
+			# into branding/content/ is not enough -- it must be registered, or
+			# chrome://branding/content/<name> 404s at runtime while the CSS that
+			# references it looks perfectly correct. That is exactly how the
+			# wallpaper and the tint logo both failed to appear.
+			local brand_jar="${branding_dir}/content/jar.mn"
+			if [[ -f "${brand_jar}" ]]; then
+				local bname
+				for bname in newtab-background.png newtab-logo-tint.svg private-wallpaper.png; do
+					grep -q "content/branding/${bname}\$" "${brand_jar}" || \
+						printf '    content/branding/%s\n' "${bname}" >> "${brand_jar}" \
+						|| die "Failed to register ${bname} in ${brand_jar}"
+				done
+				einfo "    registered newtab assets in content/jar.mn"
+			else
+				die "branding jar.mn not found at ${brand_jar}"
+			fi
+			local bcss
+			for bcss in browser/extensions/newtab/css/activity-stream.css \
+				browser/extensions/newtab/css/nova/activity-stream.css
+			do
+				[[ -f "${bcss}" ]] || continue
+			perl -0pi -e 's|(\nbody \{[^}]*?background-image: var\(--newtab-wallpaper[^}]*?\n\})|$1\n\n/* RozeLynx: shipped newtab wallpaper (branding/main/no-text.png: the\n   cat-on-clouds scene without the wordmark -- the wordmark is a separate\n   element beside the 96px logo, so the background carries no text). */\nbody {\n  background-image: url("chrome://branding/content/newtab-background.png");\n}|s' \
+				"${bcss}" 2>/dev/null || true
+			einfo "    newtab wallpaper: branding/main/no-text.png (${bcss##*/})"
+			done
+		else
+			ewarn "branding/newtab-background.png absent; the newtab keeps its flat background"
+		fi
+
+		# Newtab logo tintability. This is a CSS change, not an art change.
+		#
+		# browser/extensions/newtab/css/activity-stream.css draws the newtab
+		# logo as a background-image of a raster:
+		#     .logo-and-wordmark .logo {
+		#       background: image-set(url(".../about-logo.png"), ...);
+		#     }
+		# A background-image has no fill hook, so that mark cannot be recoloured
+		# and carries whatever colour was baked into the PNG. The wordmark beside
+		# it does not have this problem: it is an SVG with
+		# -moz-context-properties: fill and fill: var(--newtab-wordmark-color).
+		# So with Appearance's "Override colors" enabled, the page repaints, the
+		# wordmark follows the theme, and the logo either clashes or disappears
+		# against it -- while still being a full-colour raster.
+		#
+		# The fix is to route the logo through the same mechanism: a monochrome
+		# silhouette SVG (branding/vector/newtab-logo-tint.svg, traced from the
+		# alpha channel of dark-cropped-transparent.png) with fill="context-fill",
+		# plus -moz-context-properties: fill on the rule so Gecko substitutes the
+		# consumer's colour. Both the legacy and nova stylesheets get it.
+		local tint_svg="${branding_src}/vector/newtab-logo-tint.svg"
+		if [[ -f "${tint_svg}" ]]; then
+			cp "${tint_svg}" "${branding_dir}/content/newtab-logo-tint.svg" \
+				|| die "Failed to install the newtab tint logo"
+
+			# Private NEWTAB favicon (the claw). Staged into the source tree here,
+			# in src_prepare, because a new source file has to exist BEFORE the
+			# packaging step runs -- doing this in src_install was the previous
+			# attempt and it silently produced nothing.
+			#
+			# themes/shared/jar.inc.mn is the allowlist that governs this directory
+			# (browser/themes/linux/jar.mn pulls it in with
+			# "#include ../shared/jar.inc.mn"). Registering the file in linux/jar.mn
+			# instead, as an earlier attempt did, does nothing: that file's % line
+			# maps browser/themes/linux/ into the skin, and the ../shared/ entries
+			# there are the exception, not the rule.
+			local claw_svg="${FILESDIR}/rozelynx/branding/privateNewtabFavicon.svg"
+			if [[ -f "${claw_svg}" ]]; then
+				# The claw becomes the about:privatebrowsing tab icon. This is
+				# the slot that actually decides what a private window's
+				# newtab shows: browser.js gPageIcons maps
+				#     "about:privatebrowsing":
+				#         "chrome://browser/skin/privatebrowsing/favicon.svg"
+				# and a private window's newtab IS about:privatebrowsing, not
+				# about:newtab. The generic logo copied over this slot earlier
+				# in this function is what kept showing as the "old favicon".
+				# Last writer wins, same as the paw/default*.png ordering.
+				# The slot is registered upstream, so no jar.mn surgery is
+				# needed and chrome://browser/skin/privatebrowsing/favicon.svg
+				# resolves by construction.
+				cp "${claw_svg}" \
+					"browser/themes/shared/privatebrowsing/favicon.svg" \
+					|| die "Failed to install the claw as the private newtab favicon"
+
+				# Still stage the identity-block copy too: the profile's
+				# privateNewtabChrome.css rule (see the chrome-skin action)
+				# historically pointed there, and the file is harmless to
+				# ship. Registering it in shared/jar.inc.mn is the allowlist
+				# that governs themes/shared (a file not listed there is
+				# silently dropped, with no warning).
+				cp "${claw_svg}" \
+					"browser/themes/shared/identity-block/privateNewtabFavicon.svg" \
+					|| die "Failed to stage the private newtab favicon"
+				local skin_inc="browser/themes/shared/jar.inc.mn"
+				[[ -f "${skin_inc}" ]] \
+					|| die "shared theme jar.inc.mn not found at ${skin_inc}"
+				grep -q 'identity-block/privateNewtabFavicon.svg' "${skin_inc}" || \
+					printf '    skin/classic/browser/identity-block/privateNewtabFavicon.svg   (../shared/identity-block/privateNewtabFavicon.svg)\n' \
+					>> "${skin_inc}" \
+					|| die "Failed to register the private newtab favicon"
+				einfo "    private newtab favicon: branding/claw.png -> privatebrowsing/favicon.svg"
+			else
+				ewarn "branding/privateNewtabFavicon.svg absent; private newtab keeps the paw mark"
+			fi
+
+		# Private newtab page (about:privatebrowsing) wallpaper + logo
+		# removal. The pounce-through-the-thorns scene
+		# (branding/private-background.png, the marketing pounce-thorns.jpg
+		# converted to a -strip PNG at its native 1314x1197 -- no resize:
+		# the page CSS scales it cover, so committing fewer pixels would
+		# just commit blur) becomes the page background, mirroring the
+		# non-private newtab's cat-on-clouds wallpaper, and the
+		# logo-and-wordmark row is removed outright: the 96px
+		# about-private-browsing logo would sit as a mark stamped on the
+		# scene, and the "RozeLynx" wordmark (firefox-wordmark.svg tinted
+		# with currentColor -- purplish on the private page's dark
+		# canvas) is stray text on top of it. Hiding the row (not just
+		# its children) also takes the row's margin-bottom with it.
+			local private_wallpaper="${branding_src}/private-background.png"
+			if [[ -f "${private_wallpaper}" ]]; then
+				cp "${private_wallpaper}" \
+					"${branding_dir}/content/private-wallpaper.png" \
+					|| die "Failed to install the private page wallpaper"
+				local priv_css="browser/themes/shared/privatebrowsing/aboutPrivateBrowsing.css"
+				[[ -f "${priv_css}" ]] \
+					|| die "aboutPrivateBrowsing.css not found at ${priv_css}"
+				cat >> "${priv_css}" <<-'ROZELYNX_PRIVATE_PAGE'
+
+				/* RozeLynx: pounce-thorns as the page wallpaper; the
+				   logo-and-wordmark row is removed -- the branding
+				   reads from the wallpaper, not from a mark on top.
+				   cover scales the 1314x1197 source to the window
+				   without distortion, cropping the overflow rather
+				   than stretching it. The crop is CENTRED, unlike
+				   the non-private newtab's 0% 0% anchor: the
+				   scene's subject sits mid-frame, and on a wide
+				   window cover crops vertically -- the top-left
+				   anchor inherited from the cat art framed the
+				   upper part of the scene. Centring pans the
+				   viewing angle down to the subject. */
+					body {
+					  background-image: url("chrome://branding/content/private-wallpaper.png");
+					  background-size: cover;
+					  background-repeat: no-repeat;
+					  background-position: center;
+					  background-attachment: fixed;
+					}
+					.logo-and-wordmark {
+					  display: none;
+					}
+					ROZELYNX_PRIVATE_PAGE
+				einfo "    private newtab page: private-background.png (pounce-thorns) wallpaper, logo row removed"
+			else
+				ewarn "branding/private-background.png absent; the private page keeps its flat background"
+			fi
+			local ncss
+			for ncss in browser/extensions/newtab/css/activity-stream.css \
+				browser/extensions/newtab/css/nova/activity-stream.css
+			do
+				[[ -f "${ncss}" ]] || continue
+				# Point the rule at the tintable SVG. Matched on the full
+				# upstream declaration including the trailing semicolon; the
+				# image-set() and its @2x variant both disappear, because the
+				# SVG scales itself.
+				sed -i \
+					-e 's|background: image-set(url("chrome://branding/content/about-logo.png"), url("chrome://branding/content/about-logo@2x.png") 2x) no-repeat center;|background: url("chrome://branding/content/newtab-logo-tint.svg") no-repeat center;|' \
+					"${ncss}" 2>/dev/null || true
+			# Append the context-properties declaration to the same rule. Done
+			# with a targeted append rather than a rewrite so the surrounding
+			# upstream block (display/size) is left untouched.
+			perl -0pi -e 's|(\.logo-and-wordmark \.logo \{[^}]*?)\n\}|$1\n  -moz-context-properties: fill;\n  fill: var(--newtab-wordmark-color);\n}|s' \
+				"${ncss}" 2>/dev/null || true
+			# Size the pair to the private newtab's logo-and-wordmark
+			# (aboutPrivateBrowsing.css: a var(--size-image-xxlarge) = 96px
+			# logo and a 172x96 wordmark). The non-private logo had drifted:
+			# upstream's 64px box got the full-bleed tint silhouette, which
+			# reads far larger than the mark inside the private page's scene
+			# art, and nova hid the wordmark entirely so the mark stood
+			# alone. Matching the private page's numbers fixes both.
+			#
+			# Each substitution is scoped to a whole rule and anchored at
+			# line start, so prefixed variants (.classic-enabled ...) keep
+			# their selector, and only the size numbers inside the block
+			# are rewritten. The classic small-screen variants are moved
+			# with it so a narrow window does not fall back to the old pair.
+			perl -0pi -e 's|^(\s*\.logo-and-wordmark \.logo \{)([^}]*?)(\})|my ($h,$b,$t)=($1,$2,$3); $b =~ s/\b64px\b/96px/g; "$h$b$t"|gem' \
+				"${ncss}" 2>/dev/null || true
+			perl -0pi -e 's|^(\s*\.classic-enabled \.logo-and-wordmark \.logo \{)([^}]*?)(\})|my ($h,$b,$t)=($1,$2,$3); $b =~ s/\b64px\b/96px/g; "$h$b$t"|gem' \
+				"${ncss}" 2>/dev/null || true
+			perl -0pi -e 's|^(\s*\.logo-and-wordmark \.wordmark \{)([^}]*?)(\})|my ($h,$b,$t)=($1,$2,$3); $b =~ s/\b105px\b/172px/g; $b =~ s/\b64px\b/96px/g; "$h$b$t"|gem' \
+				"${ncss}" 2>/dev/null || true
+			perl -0pi -e 's|^(\s*\.classic-enabled \.logo-and-wordmark \.wordmark \{)([^}]*?)(\})|my ($h,$b,$t)=($1,$2,$3); $b =~ s/\b100px\b/172px/g; $b =~ s/\b64px\b/96px/g; "$h$b$t"|gem' \
+				"${ncss}" 2>/dev/null || true
+			# The wordmark text is hidden in BOTH layouts: the wallpaper
+			# carries the branding, and the "RozeLynx" wordmark
+			# (firefox-wordmark.svg tinted with the theme colour) read as
+			# stray purplish text on top of it. The nova variant is spelled
+			# out because upstream shows the wordmark there inside wide
+			# container queries, and a plain .wordmark rule would lose on
+			# specificity to the .nova-enabled selectors.
+			cat >> "${ncss}" <<-'ROZELYNX_NEWTAB_WORDMARK'
+
+				/* RozeLynx: the wallpaper carries the branding; no wordmark
+				   text on top of it, in either layout. */
+				.logo-and-wordmark .wordmark,
+				.nova-enabled .logo-and-wordmark .wordmark {
+				  display: none;
+				}
+				ROZELYNX_NEWTAB_WORDMARK
+			einfo "    newtab logo: 96px, wordmark text hidden (${ncss##*/})"
+			done
+		else
+			ewarn "branding/vector/newtab-logo-tint.svg absent; the newtab logo stays a full-colour raster"
+		fi
+
 		# about-logo.svg is the vector slot that the initial profile
 		# selector (about:profiles) draws, plus a few other chrome
 		# surfaces. Copying the old rose SVG over it here is exactly why
 		# the new artwork kept not appearing there, so this slot now gets
 		# the drop-in-or-placeholder treatment: the newest PNG art is
 		# embedded until a real vector is dropped into branding/vector/.
-		# embed width 192 gives 3x headroom over the largest consumer
-		# (the 64x64 .logo in profile-selector.css) at ~74 KB base64.
+		# embed width 960 gives 3x headroom over the largest consumer (the
+		# 320x320 .logo that profile-selector-logo-size.patch introduces
+		# below), so the slot is sharp at its new size instead of upscaling
+		# a 192px embed. The slot canvas stays 512x512 to match upstream.
 		rozelynx_install_vector_slot about-logo.svg \
-			"${branding_dir}/content/about-logo.svg" 512 512 192 \
+			"${branding_dir}/content/about-logo.svg" 512 512 960 \
 			"${branding_src}/main/no-text.png" \
 			|| die "Failed to install the about-logo.svg branding slot"
+		# Grow the consumer to match: upstream sizes .logo at 64px, which
+		# leaves a full illustration unreadable.
+		eapply "${FILESDIR}/rozelynx/branding/profile-selector-logo-size.patch" \
+			|| die "profile-selector-logo-size.patch failed to apply"
 		# The unified-extensions panel's empty state (the toolbar
 		# extensions button with nothing to list) takes its
 		# illustration from CSS "content: url(...)" on the <img> in
@@ -1170,8 +1691,10 @@ See files/rozelynx/branding/PLACEHOLDERS.md. -->"
 		# (defaults/settings/main/newtab-wallpapers-v2.json). Neither path
 		# has a build-time branding slot: branding it would mean rewriting a
 		# Mozilla-maintained catalogue or picking a colour for the user.
-		# Recorded rather than faked; branding/main/full.png stays in the
-		# repo as unused artwork.
+		# Recorded rather than faked; the old branding/main/full.png (and the
+		# {dark,light}/wordmark.png + light/no-text.png siblings) were deleted
+		# from the overlay as unused artwork — nothing reads them, so nothing
+		# regenerates them either.
 	fi
 
 	# --- RozeLynx debug patches ---
@@ -1273,7 +1796,13 @@ PWAMOZ
 			"${S}/netwerk/base/rozelynx-netiface/" || die
 		sed -i '/"url-classifier",/a\    "base/rozelynx-netiface",' \
 			"${S}/netwerk/moz.build" || die
-		eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-necko.patch" || die
+		if ver_test ${PV} -ge 158.0; then
+			eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-necko-158.patch" || die
+		elif ver_test ${PV} -ge 157.0; then
+			eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-necko-157.patch" || die
+		else
+			eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-necko.patch" || die
+		fi
 		# v14 webrtc: WebRTC ICE follows the interface assignment - nICEr
 		# opens its own PR sockets and resolved STUN/TURN names through a
 		# null-AdditionalInfo AsyncResolveNative, so a bound tab still
@@ -1308,6 +1837,78 @@ PWAMOZ
 		eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-sessionrestore.patch" || die
 	fi
 
+	# --- RozeLynx pam-passkeys: local WebAuthn platform authenticator whose
+	# user verification runs through PAM (howdy face auth first, account
+	# password fallback); USB security keys keep working via authrs_bridge ---
+	if use pam-passkeys; then
+		if ver_test ${PV} -ge 156.0; then
+			einfo "Applying PAM passkey platform authenticator (howdy + password)..."
+			mkdir -p "${S}/dom/webauthn/rozelynx-pam" || die
+			cp "${FILESDIR}/rozelynx/cpp/webauthn-pam/"*.cpp \
+				"${FILESDIR}/rozelynx/cpp/webauthn-pam/"*.h \
+				"${FILESDIR}/rozelynx/cpp/webauthn-pam/moz.build" \
+				"${S}/dom/webauthn/rozelynx-pam/" || die
+			eapply "${FILESDIR}/rozelynx/cpp/webauthn-pam/webauthn-pam-service.patch" || die
+			eapply "${FILESDIR}/rozelynx/cpp/webauthn-pam/webauthn-pam-prompt-helper.patch" || die
+			eapply "${FILESDIR}/rozelynx/cpp/webauthn-pam/webauthn-pam-static-prefs.patch" || die
+		else
+			ewarn "pam-passkeys needs >=firefox-156 (dom/webauthn layout); skipping"
+		fi
+	fi
+
+	# --- RozeLynx download-handoff: the browser-side hand-off engine ---
+	# The engine, the interception gate in nsExternalHelperAppService::
+	# OnStartRequest and the Settings > General editor. OnStartRequest asks
+	# the engine BEFORE any save UI exists and only cancels when a handler
+	# ACCEPTS - a declined hand-off falls through to the browser's own
+	# flow with nothing lost.
+	if use download-handoff; then
+		einfo "Applying RozeLynx download hand-off engine..."
+		mkdir -p "${S}/uriloader/exthandler/rozelynx-handoff" || die
+		cp "${FILESDIR}/rozelynx/cpp/download-handoff/"*.cpp 			"${FILESDIR}/rozelynx/cpp/download-handoff/"*.h 			"${FILESDIR}/rozelynx/cpp/download-handoff/"*.idl 			"${FILESDIR}/rozelynx/cpp/download-handoff/"*.conf 			"${FILESDIR}/rozelynx/cpp/download-handoff/moz.build" 			"${S}/uriloader/exthandler/rozelynx-handoff/" || die
+		sed -i '/"exthandler",/a\    "exthandler/rozelynx-handoff",' \
+			"${S}/uriloader/moz.build" || die
+		eapply "${FILESDIR}/rozelynx/cpp/download-handoff/handoff-exthandler.patch" || die
+		eapply "${FILESDIR}/rozelynx/cpp/download-handoff/handoff-prefs-general.patch" || die
+		cp "${FILESDIR}/rozelynx/cpp/download-handoff/rozelynx-handoff.js" \
+			"${FILESDIR}/rozelynx/cpp/download-handoff/rozelynx-handoff.inc.xhtml" \
+			"${S}/browser/components/preferences/" || die
+	fi
+
+	# --- RozeLynx sync: the rozelynxsync:// magic-link scheme handler ---
+	# Registered only for trusted principals (URL bar, command line,
+	# extension pages); web content cannot drive a state restore.
+	if use sync; then
+		einfo "Applying RozeLynx sync magic-link scheme..."
+		mkdir -p "${S}/netwerk/base/rozelynx-sync" || die
+		cp "${FILESDIR}/rozelynx/cpp/sync-scheme/"*.cpp \
+			"${FILESDIR}/rozelynx/cpp/sync-scheme/"*.h \
+			"${FILESDIR}/rozelynx/cpp/sync-scheme/"*.conf \
+			"${FILESDIR}/rozelynx/cpp/sync-scheme/moz.build" \
+			"${S}/netwerk/base/rozelynx-sync/" || die
+		sed -i '/"url-classifier",/a\    "base/rozelynx-sync",' \
+			"${S}/netwerk/moz.build" || die
+	fi
+
+	# --- Toolchain compatibility: GCC 16 / libstdc++ 16 <cmath> ---
+	#
+	# dom/media/mediacapabilities/MediaCapabilitiesValidation.cpp:266 calls
+	# isfinite() unqualified. It includes <cmath>, which declares
+	# std::isfinite; libstdc++ 16 no longer surfaces the unqualified name in
+	# the global namespace here, so the file fails to build:
+	#
+	#   error: use of undeclared identifier 'isfinite'
+	#   note: 'std::isfinite' declared here
+	#
+	# This is upstream 156 against a newer libstdc++, not a RozeLynx change
+	# -- nothing in files/ touches dom/media. Unrelated to branding, but it
+	# is fatal, so it gates every build. One line, semantics identical.
+	local gcc16_cmath="${FILESDIR}/rozelynx/toolchain/gcc16-cmath-isfinite.patch"
+	if [[ -f "${gcc16_cmath}" ]]; then
+		eapply "${gcc16_cmath}" \
+			|| die "Failed to apply the GCC 16 <cmath> isfinite fix"
+	fi
+
 	# --- LibreWolf-style privacy patches ---
 	# disable-data-reporting-at-compile-time.patch conflicts with
 	# rozelynx-configure.patch on browser/moz.configure. The RozeLynx
@@ -1338,7 +1939,11 @@ PWAMOZ
 		eapply "${FILESDIR}/librewolf/remove-pingsender.patch"
 	fi
 	if use remove-openai; then
-		eapply "${FILESDIR}/librewolf/remove-openai.patch"
+		if ver_test ${PV} -ge 158.0; then
+			eapply "${FILESDIR}/librewolf/remove-openai-158.patch"
+		else
+			eapply "${FILESDIR}/librewolf/remove-openai.patch"
+		fi
 	fi
 	if use webgl-permission; then
 		eapply "${FILESDIR}/librewolf/webgl-permission.patch"
@@ -1416,7 +2021,11 @@ PWAMOZ
 			einfo "  Skipping firefox-view.patch (upstreamed in 154)"
 		fi
 		eapply "${FILESDIR}/librewolf/ui-patches/handlers.patch"
-		eapply "${FILESDIR}/librewolf/ui-patches/neterror.patch"
+		if ver_test ${PV} -ge 158.0; then
+			eapply "${FILESDIR}/librewolf/ui-patches/neterror-158.patch"
+		else
+			eapply "${FILESDIR}/librewolf/ui-patches/neterror.patch"
+		fi
 		eapply "${FILESDIR}/librewolf/ui-patches/pref-naming.patch"
 		eapply "${FILESDIR}/librewolf/ui-patches/home-preferences.patch"
 		eapply "${FILESDIR}/librewolf/ui-patches/trustpanel.patch"
@@ -1469,6 +2078,7 @@ PWAMOZ
 	find "${S}"/third_party -type f \( -name '*.so' -o -name '*.o' \) -print -delete || die
 	moz_clear_vendor_checksums glslopt
 	moz_clear_vendor_checksums encoding_rs
+	moz_clear_vendor_checksums bindgen
 
 	if [[ -n ${FILES_PER_UNIFIED_FILE} ]] && use jumbo-build; then
 		local my_files_per_unified_file=${FILES_PER_UNIFIED_FILE:=16}
@@ -1525,7 +2135,7 @@ src_configure() {
 	mozconfig_add_options_ac 'Gentoo default' \
 		--allow-addon-sideload --disable-cargo-incremental --disable-crashreporter --disable-disk-remnant-avoidance \
 		--disable-geckodriver --disable-install-strip --disable-legacy-profile-creation --disable-parental-controls \
-		--disable-strip --disable-updater --disable-wmf --enable-negotiateauth --enable-new-pass-manager \
+		--disable-strip --disable-updater --enable-negotiateauth --enable-new-pass-manager \
 		--enable-official-branding --enable-packed-relative-relocs --enable-release --enable-system-policies \
 		--host="x86_64-unknown-linux-gnu" --libdir="${EPREFIX}/usr/$(get_libdir)" --prefix="${EPREFIX}/usr" \
 		--target="x86_64-unknown-linux-gnu" --without-ccache --with-intl-api --with-libclang-path="$(llvm-config --libdir)" \
@@ -1600,7 +2210,6 @@ src_configure() {
 		mozconfig_add_options_ac 'no wasm-sandbox' --without-wasm-sandboxed-libraries
 		mozconfig_use_with system-harfbuzz system-graphite2
 	fi
-	! use jpegxl && mozconfig_add_options_ac '-jpegxl' --disable-jxl
 
 	if [[ ${use_lto} == "yes" ]] ; then
 		if use clang ; then
@@ -1729,6 +2338,11 @@ src_install() {
 		einfo "Installing RozeLynx system preferences..."
 		insinto "${PREFS_DIR}"
 		newins "${FILESDIR}/rozelynx/prefs/rozelynx-prefs.js" rozelynx-prefs.js
+	fi
+
+	if use pam-passkeys; then
+		einfo "Installing RozeLynx PAM passkey service (/etc/pam.d/rozelynx)..."
+		newpamd "${FILESDIR}/rozelynx/cpp/webauthn-pam/rozelynx.pam" rozelynx
 	fi
 
 	if use hwaccel ; then
@@ -1867,6 +2481,43 @@ with open('${policies_json}', 'w') as f:
 			# verification (signedState NOT_REQUIRED, no banners) is complete.
 		fi
 
+		# --- RozeLynx 2FA: the separate two-factor extension ---
+		# TOTP/HOTP vault (passphrase-encrypted), otpauth:// capture, page
+		# autofill. A whole extension of its own, not a features-module: it
+		# owns secrets and can be installed or removed independently.
+		if use twofa; then
+			einfo "Assembling RozeLynx 2FA extension..."
+			local tfa_src="${FILESDIR}/rozelynx/extension-2fa"
+			local tfa_dest="${T}/rozelynx-2fa-extension"
+			rm -rf "${tfa_dest}"
+			cp -a "${tfa_src}" "${tfa_dest}" || die
+			rm -f "${tfa_dest}/README.md"
+
+			(cd "${tfa_dest}" && zip -qr "${T}/rozelynx-2fa@bytewheel.org.xpi" .) \
+				|| die "failed to create the 2FA XPI"
+			local ext_install_dir="${MOZILLA_FIVE_HOME}/distribution/extensions"
+			insinto "${ext_install_dir}"
+			newins "${T}/rozelynx-2fa@bytewheel.org.xpi" "rozelynx-2fa@bytewheel.org.xpi"
+			einfo "Installed RozeLynx 2FA XPI to ${ext_install_dir}/"
+
+			local policies_json="${ED}${MOZILLA_FIVE_HOME}/distribution/policies.json"
+			if [[ -f "${policies_json}" ]]; then
+				einfo "Registering RozeLynx 2FA in policies.json..."
+				python3 -c "
+import json
+with open('${policies_json}') as f:
+    p = json.load(f)
+es = p['policies'].setdefault('ExtensionSettings', {})
+es['rozelynx-2fa@bytewheel.org'] = {
+    'installation_mode': 'force_installed',
+    'install_url': 'file://${MOZILLA_FIVE_HOME}/distribution/extensions/rozelynx-2fa@bytewheel.org.xpi'
+}
+with open('${policies_json}', 'w') as f:
+    json.dump(p, f, indent=4)
+" || ewarn "Failed to update policies.json for the 2FA extension"
+			fi
+		fi
+
 		# Install Lepton skin browser chrome CSS (reference file for userChrome.css)
 		if use lepton-skin; then
 			einfo "Installing Lepton skin CSS files..."
@@ -1941,6 +2592,25 @@ SSBEOF
 			fi
 		fi
 
+		# Private-TAB favicon rule (claw mark). Installed unconditionally and
+		# imported from every seeded userChrome.css, alongside the SSB import.
+		#
+		# It cannot be shipped inside omni.ja: browser chrome CSS is only read
+		# from the profile, and it is not gated on lepton-skin or pwa because a
+		# private tab should read as private whether or not the skin is on. It is
+		# installed into browser/defaults/rozelynx, which the host lists in
+		# SKIN_FILES so it is symlinked into each profile's chrome dir and
+		# imported by bare filename (see CHROME_ALWAYS_IMPORTS). Only the claw
+		# artwork it references is a packaged skin file hit by chrome:// URL.
+		if [[ -f "${FILESDIR}/rozelynx/branding/privateNewtabChrome.css" ]]; then
+			insinto "${MOZILLA_FIVE_HOME}/browser/defaults/rozelynx"
+			doins "${FILESDIR}/rozelynx/branding/privateNewtabChrome.css"
+			einfo "  Private-NEWTAB favicon rule installed"
+		else
+			ewarn "branding/privateNewtabChrome.css absent; private newtab keeps the paw mark"
+		fi
+
+
 		# External browser support: native messaging host (browser detection
 		# for the context-menu submenu) + rozelynx-ext: scheme handler
 		if use external-browser || use mouse-gestures; then
@@ -1983,8 +2653,39 @@ SSBEOF
 		insinto /usr/share/icons/hicolor/symbolic/apps
 		newins "${FILESDIR}/rozelynx/icon/rozelynx-symbolic.svg" rozelynx-symbolic.svg
 
-		insinto /usr/share/icons/hicolor/scalable/apps
-		newins "${FILESDIR}/rozelynx/icon/rozelynx.svg" rozelynx.svg
+		# The scalable theme icon (hicolor scalable/apps/rozelynx.svg) is
+		# what the Icon=rozelynx theme name resolves to - the .desktop's own
+		# icon, the notification badge fallback, and the PWA module's
+		# last-resort Icon= for a site whose own icon could not be
+		# materialised. Copying icon/rozelynx.svg (the old rose vector) there
+		# put the discontinued logo on every one of those surfaces, which is
+		# exactly the mismatch the PWA ladder exists to hide. So the scalable
+		# slot is GENERATED from branding/paw.png (the same mark the PNG
+		# ladder carries), base64-embedded the same way defaultFavicon.svg
+		# embeds favicon64: no committed base64 blob, re-droppable at any
+		# resolution, and the theme name and the PNG ladder can no longer
+		# disagree. icon/rozelynx.svg stays what the in-chrome rebranding
+		# sweep copies (a separate, still-open vector gap).
+		if [[ -f "${FILESDIR}/rozelynx/branding/paw.png" ]] \
+			&& command -v base64 >/dev/null 2>&1; then
+			local rozelynx_theme_b64
+			rozelynx_theme_b64="$(base64 -w0 "${FILESDIR}/rozelynx/branding/paw.png")"
+			cat > "${T}/rozelynx-theme.svg" <<-ROZELYNX_THEME_ICON || die "Failed to write the scalable theme icon"
+				<!-- RozeLynx: branding/paw.png embedded as the hicolor scalable theme icon.
+				     The PNG ladder under hicolor/<n>x<n>/apps/rozelynx.png carries the same
+				     artwork, so every Icon=rozelynx consumer and every size agree. -->
+				<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="474" height="474" viewBox="0 0 474 474">
+				  <image x="0" y="0" width="474" height="474" preserveAspectRatio="xMidYMid meet" xlink:href="data:image/png;base64,${rozelynx_theme_b64}"/>
+				</svg>
+			ROZELYNX_THEME_ICON
+			insinto /usr/share/icons/hicolor/scalable/apps
+			newins "${T}/rozelynx-theme.svg" rozelynx.svg
+			einfo "  scalable theme icon: branding/paw.png (replaces the old rose vector)"
+		else
+			ewarn "branding/paw.png absent; the scalable theme icon stays the old rose vector"
+			insinto /usr/share/icons/hicolor/scalable/apps
+			newins "${FILESDIR}/rozelynx/icon/rozelynx.svg" rozelynx.svg
+		fi
 
 		dosym /usr/share/icons/hicolor/scalable/apps/rozelynx.svg \
 			/usr/share/icons/hicolor/symbolic/apps/org.bytewheel.rozelynx-symbolic.svg
@@ -2030,6 +2731,14 @@ SSBEOF
 			-e "s:@EXEC@:${exec_command}:" \
 			-e "s:@ICON@:${icon_name}:" \
 			"${WORKDIR}/rozelynx.desktop-template" || die
+		# The OS half of the sync magic-link handoff: clicking a
+		# rozelynxsync:// link in any other app launches RozeLynx with it.
+		# Registered only when the scheme handler is compiled in (use sync).
+		if use sync; then
+			sed -i \
+				-e 's#^MimeType=\(.*\)$#MimeType=\1x-scheme-handler/rozelynxsync;#' \
+				"${WORKDIR}/rozelynx.desktop-template" || die
+		fi
 		newmenu "${WORKDIR}/rozelynx.desktop-template" "${desktop_filename}"
 		rm "${WORKDIR}/rozelynx.desktop-template" || die
 
@@ -2093,12 +2802,6 @@ SSBEOF
 			-i "${ED}/usr/share/dbus-1/services/org.mozilla.firefox.SearchProvider.service" || die
 		cat >>"${GENTOO_PREFS}" <<-EOF || die
 		pref("browser.gnome-search-provider.enabled", true);
-		EOF
-	fi
-
-	if use jpegxl ; then
-		cat >>"${GENTOO_PREFS}" <<-EOF || die
-		pref("image.jxl.enabled", true);
 		EOF
 	fi
 
@@ -2198,6 +2901,15 @@ pkg_postinst() {
 			elog "  scheme handler:        rozelynx-ext: (launcher: ${MOZILLA_FIVE_HOME}/open-external)"
 			elog "  activity log:          /tmp/rozelynx-open-external.log"
 		fi
+		if use pam-passkeys; then
+			elog "PAM passkeys (local platform authenticator) enabled!"
+			elog "  WebAuthn passkey prompts now offer this device next to USB security"
+			elog "  keys; user verification runs through PAM: face recognition via"
+				elog "  howdy when ${EROOT%/}/etc/pam.d/rozelynx or the system-auth chain"
+				elog "  carries pam_howdy.so, otherwise the account password prompt."
+				elog "  Disable at runtime: security.webauthn.rozelynx_pam.enabled"
+				elog "  USB/NFC security keys keep working in every case."
+		fi
 		elog ""
 		elog "Available USE flags for features:"
 		elog "  chrome-web-store   - Install extensions from Chrome Web Store"
@@ -2209,6 +2921,13 @@ pkg_postinst() {
 		elog "  pwa                - Progressive Web App support"
 		elog "  lepton-skin        - Compact Lepton UI theme"
 		elog "  ip-protection      - IP protection privacy overrides"
+		elog "  net-iface          - Per-tab network interface pinning"
+		elog "  pam-passkeys       - Local passkeys via PAM (howdy / password)"
+		elog "  download-handoff   - Hand downloads to an external manager"
+		elog "                      (Settings > General > Download hand-off)"
+		elog "  user-agent         - User agent switcher (global + per-URL rules)"
+		elog "  sync               - Magic-link state sync (rozelynxsync:)"
+		elog "  twofa              - RozeLynx 2FA extension (TOTP/HOTP vault)"
 		elog ""
 	fi
 

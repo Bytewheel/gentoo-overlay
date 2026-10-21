@@ -48,7 +48,7 @@ MOZ_PV_DISTFILES="${MOZ_PV}${MOZ_PV_SUFFIX}"
 MOZ_P_DISTFILES="${MOZ_PN}-${MOZ_PV_DISTFILES}"
 
 inherit check-reqs desktop flag-o-matic gnome2-utils linux-info llvm-r1 multiprocessing \
-	optfeature pax-utils python-any-r1 readme.gentoo-r1 rust toolchain-funcs virtualx xdg
+	optfeature pam pax-utils python-any-r1 readme.gentoo-r1 rust toolchain-funcs virtualx xdg
 
 MOZ_SRC_BASE_URI="https://archive.mozilla.org/pub/${MOZ_PN}/releases/${MOZ_PV}"
 
@@ -76,7 +76,7 @@ IUSE="+clang dbus debug eme-free hardened hwaccel jack libproxy pgo pulseaudio s
 IUSE+=" +system-av1 +system-harfbuzz +system-icu +system-jpeg +system-libevent +system-libvpx"
 IUSE+=" system-pipewire system-png +system-webp test valgrind wayland wifi +X"
 
-IUSE+=" +gmp-autoupdate gnome-shell jpegxl +jumbo-build openh264 +telemetry wasm-sandbox"
+IUSE+=" +gmp-autoupdate gnome-shell +jumbo-build openh264 +telemetry wasm-sandbox"
 
 # LibreWolf-style privacy hardening USE flags (from parent ebuild):
 IUSE+=" remove-safebrowsing remove-pocket remove-password-manager"
@@ -99,12 +99,28 @@ IUSE+=" language-packs xdg-profile newtab-fixes"
 # lepton-skin:        Compact Lepton UI theme CSS
 # ip-protection:      IP protection privacy UI overrides
 # net-iface:         Per-tab / per-container / per-profile interface pinning
+# pam-passkeys:      Local WebAuthn passkeys whose user verification runs
+#                    through PAM - howdy face authentication first, the
+#                    account password as fallback (USB security keys keep
+#                    working; everything the local authenticator cannot
+#                    serve is forwarded to them)
 # download-handoff:  Hand downloads off to a configured download manager
 #                     (any extension that answers, any program on PATH, or
-#                     the built-in uGet integrator) before the save UI
+#                     the built-in uGet integrator) before the save UI.
+#                     BROWSER CODE since 158.0.3: the engine and the
+#                     Settings > General editor live in
+#                     uriloader/exthandler/rozelynx-handoff/, and the
+#                     extension carries only the ext:<id> relay module
+# user-agent:        User agent switcher: preset/raw global override and
+#                     per-URL rules (extension popup + options page)
+# sync:              Account-less state sync: the rozelynxsync:// magic
+#                     link scheme (browser engine) + the extension's
+#                     gather/encrypt/restore module
+# twofa:             RozeLynx 2FA: the separate two-factor extension
+#                     (TOTP/HOTP vault, otpauth:// capture, page autofill)
 IUSE+=" rozelynx rozelynx-debug chrome-web-store experiments external-browser"
 IUSE+=" i18n mouse-gestures qr-code pwa lepton-skin ip-protection net-iface"
-IUSE+=" download-handoff"
+IUSE+=" download-handoff user-agent sync twofa pam-passkeys"
 
 REQUIRED_USE="|| ( X wayland )
 	debug? ( !system-av1 )
@@ -122,7 +138,11 @@ REQUIRED_USE="|| ( X wayland )
 	ip-protection? ( rozelynx )
 	pwa? ( rozelynx )
  	net-iface? ( rozelynx )
+	pam-passkeys? ( rozelynx )
 	download-handoff? ( rozelynx )
+	user-agent? ( rozelynx )
+	sync? ( rozelynx )
+	twofa? ( rozelynx )
  "
 
 RESTRICT="!test? ( test )"
@@ -145,7 +165,7 @@ BDEPEND="${PYTHON_DEPS}
 	app-arch/zip
 	>=dev-util/cbindgen-0.29.4
 	rozelynx? ( media-gfx/imagemagick )
-	net-libs/nodejs
+	net-libs/nodejs[ssl]
 	virtual/pkgconfig
 	amd64? ( >=dev-lang/nasm-2.14 )
 	x86? ( >=dev-lang/nasm-2.14 )
@@ -164,7 +184,7 @@ COMMON_DEPEND="${FF_ONLY_DEPEND}
 	>=app-accessibility/at-spi2-core-2.46.0:2
 	dev-libs/glib:2
 	dev-libs/libffi:=
-	>=dev-libs/nss-3.125
+	>=dev-libs/nss-3.130
 	>=dev-libs/nspr-4.39
 	media-libs/alsa-lib
 	media-libs/fontconfig
@@ -181,6 +201,7 @@ COMMON_DEPEND="${FF_ONLY_DEPEND}
 	dbus? (
 		sys-apps/dbus
 	)
+	pam-passkeys? ( sys-libs/pam )
 	jack? ( virtual/jack )
 	pulseaudio? (
 		|| (
@@ -392,7 +413,12 @@ rozelynx_enabled_modules() {
 	use lepton-skin && modules+=( "lepton-skin" )
   use ip-protection && modules+=( "ip-protection" )
   use net-iface && modules+=( "net-iface" )
-  use download-handoff && modules+=( "download-handoff" )
+  # The hand-off ENGINE is browser code (the download-handoff flag wires
+  # the C++ module in src_prepare below); the extension module is the
+  # ext:<id> relay that delivers download messages to other extensions.
+  use download-handoff && modules+=( "handoff-relay" )
+  use user-agent && modules+=( "user-agent" )
+  use sync && modules+=( "sync" )
   echo "${modules[@]}"
 }
 
@@ -554,9 +580,6 @@ src_prepare() {
 		_lw_patch_ver=legacy
 	fi
 
-	if [[ ${use_lto} == "yes" ]]; then
-		rm -v "${WORKDIR}"/firefox-patches/*-LTO-Only-enable-LTO-*.patch || die
-	fi
 	if use elibc_glibc ; then
 		rm -v "${WORKDIR}"/firefox-patches/*bgo-748849-RUST_TARGET_override.patch || die
 		rm -v "${WORKDIR}"/firefox-patches/*bgo-967694-musl-prctrl-exception-on-musl.patch || die
@@ -962,10 +985,11 @@ src_prepare() {
 		fi
 
 		# --- Replace Firefox branding icons with RozeLynx branding ---
-		# Branding sources live in files/rozelynx/branding/{main,dark,light}/.
+		# Branding sources live in files/rozelynx/branding/{main,dark}/.
 		# Image 1 (main): cat-on-clouds — newtab background + largest branding.
-		# Image 2 (dark):  line-art icon  — dark-mode iconography (window icons, about:privatebrowsing).
-		# Image 3 (light): line-art icon  — light-mode iconography.
+		# Image 2 (dark):  line-art icon — dark-mode iconography (window icons,
+		# about:privatebrowsing placeholders). The light/ variant was deleted
+		# with the other unused logos; dark/no-text.png covers its slots.
 		local branding_src="${FILESDIR}/rozelynx/branding"
 		local branding_dir="browser/branding/rozelynx"
 
@@ -1667,8 +1691,10 @@ See files/rozelynx/branding/PLACEHOLDERS.md. -->"
 		# (defaults/settings/main/newtab-wallpapers-v2.json). Neither path
 		# has a build-time branding slot: branding it would mean rewriting a
 		# Mozilla-maintained catalogue or picking a colour for the user.
-		# Recorded rather than faked; branding/main/full.png stays in the
-		# repo as unused artwork.
+		# Recorded rather than faked; the old branding/main/full.png (and the
+		# {dark,light}/wordmark.png + light/no-text.png siblings) were deleted
+		# from the overlay as unused artwork — nothing reads them, so nothing
+		# regenerates them either.
 	fi
 
 	# --- RozeLynx debug patches ---
@@ -1770,7 +1796,9 @@ PWAMOZ
 			"${S}/netwerk/base/rozelynx-netiface/" || die
 		sed -i '/"url-classifier",/a\    "base/rozelynx-netiface",' \
 			"${S}/netwerk/moz.build" || die
-		if ver_test ${PV} -ge 157.0; then
+		if ver_test ${PV} -ge 158.0; then
+			eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-necko-158.patch" || die
+		elif ver_test ${PV} -ge 157.0; then
 			eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-necko-157.patch" || die
 		else
 			eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-necko.patch" || die
@@ -1807,6 +1835,59 @@ PWAMOZ
 		# first TCP connection. The extension's MV3 event-page rebind wakes a
 		# beat too late and the first load egresses the profile default.
 		eapply "${FILESDIR}/rozelynx/cpp/net-iface/net-iface-sessionrestore.patch" || die
+	fi
+
+	# --- RozeLynx pam-passkeys: local WebAuthn platform authenticator whose
+	# user verification runs through PAM (howdy face auth first, account
+	# password fallback); USB security keys keep working via authrs_bridge ---
+	if use pam-passkeys; then
+		if ver_test ${PV} -ge 156.0; then
+			einfo "Applying PAM passkey platform authenticator (howdy + password)..."
+			mkdir -p "${S}/dom/webauthn/rozelynx-pam" || die
+			cp "${FILESDIR}/rozelynx/cpp/webauthn-pam/"*.cpp \
+				"${FILESDIR}/rozelynx/cpp/webauthn-pam/"*.h \
+				"${FILESDIR}/rozelynx/cpp/webauthn-pam/moz.build" \
+				"${S}/dom/webauthn/rozelynx-pam/" || die
+			eapply "${FILESDIR}/rozelynx/cpp/webauthn-pam/webauthn-pam-service.patch" || die
+			eapply "${FILESDIR}/rozelynx/cpp/webauthn-pam/webauthn-pam-prompt-helper.patch" || die
+			eapply "${FILESDIR}/rozelynx/cpp/webauthn-pam/webauthn-pam-static-prefs.patch" || die
+		else
+			ewarn "pam-passkeys needs >=firefox-156 (dom/webauthn layout); skipping"
+		fi
+	fi
+
+	# --- RozeLynx download-handoff: the browser-side hand-off engine ---
+	# The engine, the interception gate in nsExternalHelperAppService::
+	# OnStartRequest and the Settings > General editor. OnStartRequest asks
+	# the engine BEFORE any save UI exists and only cancels when a handler
+	# ACCEPTS - a declined hand-off falls through to the browser's own
+	# flow with nothing lost.
+	if use download-handoff; then
+		einfo "Applying RozeLynx download hand-off engine..."
+		mkdir -p "${S}/uriloader/exthandler/rozelynx-handoff" || die
+		cp "${FILESDIR}/rozelynx/cpp/download-handoff/"*.cpp 			"${FILESDIR}/rozelynx/cpp/download-handoff/"*.h 			"${FILESDIR}/rozelynx/cpp/download-handoff/"*.idl 			"${FILESDIR}/rozelynx/cpp/download-handoff/"*.conf 			"${FILESDIR}/rozelynx/cpp/download-handoff/moz.build" 			"${S}/uriloader/exthandler/rozelynx-handoff/" || die
+		sed -i '/"exthandler",/a\    "exthandler/rozelynx-handoff",' \
+			"${S}/uriloader/moz.build" || die
+		eapply "${FILESDIR}/rozelynx/cpp/download-handoff/handoff-exthandler.patch" || die
+		eapply "${FILESDIR}/rozelynx/cpp/download-handoff/handoff-prefs-general.patch" || die
+		cp "${FILESDIR}/rozelynx/cpp/download-handoff/rozelynx-handoff.js" \
+			"${FILESDIR}/rozelynx/cpp/download-handoff/rozelynx-handoff.inc.xhtml" \
+			"${S}/browser/components/preferences/" || die
+	fi
+
+	# --- RozeLynx sync: the rozelynxsync:// magic-link scheme handler ---
+	# Registered only for trusted principals (URL bar, command line,
+	# extension pages); web content cannot drive a state restore.
+	if use sync; then
+		einfo "Applying RozeLynx sync magic-link scheme..."
+		mkdir -p "${S}/netwerk/base/rozelynx-sync" || die
+		cp "${FILESDIR}/rozelynx/cpp/sync-scheme/"*.cpp \
+			"${FILESDIR}/rozelynx/cpp/sync-scheme/"*.h \
+			"${FILESDIR}/rozelynx/cpp/sync-scheme/"*.conf \
+			"${FILESDIR}/rozelynx/cpp/sync-scheme/moz.build" \
+			"${S}/netwerk/base/rozelynx-sync/" || die
+		sed -i '/"url-classifier",/a\    "base/rozelynx-sync",' \
+			"${S}/netwerk/moz.build" || die
 	fi
 
 	# --- Toolchain compatibility: GCC 16 / libstdc++ 16 <cmath> ---
@@ -1858,7 +1939,11 @@ PWAMOZ
 		eapply "${FILESDIR}/librewolf/remove-pingsender.patch"
 	fi
 	if use remove-openai; then
-		eapply "${FILESDIR}/librewolf/remove-openai.patch"
+		if ver_test ${PV} -ge 158.0; then
+			eapply "${FILESDIR}/librewolf/remove-openai-158.patch"
+		else
+			eapply "${FILESDIR}/librewolf/remove-openai.patch"
+		fi
 	fi
 	if use webgl-permission; then
 		eapply "${FILESDIR}/librewolf/webgl-permission.patch"
@@ -1936,7 +2021,11 @@ PWAMOZ
 			einfo "  Skipping firefox-view.patch (upstreamed in 154)"
 		fi
 		eapply "${FILESDIR}/librewolf/ui-patches/handlers.patch"
-		eapply "${FILESDIR}/librewolf/ui-patches/neterror.patch"
+		if ver_test ${PV} -ge 158.0; then
+			eapply "${FILESDIR}/librewolf/ui-patches/neterror-158.patch"
+		else
+			eapply "${FILESDIR}/librewolf/ui-patches/neterror.patch"
+		fi
 		eapply "${FILESDIR}/librewolf/ui-patches/pref-naming.patch"
 		eapply "${FILESDIR}/librewolf/ui-patches/home-preferences.patch"
 		eapply "${FILESDIR}/librewolf/ui-patches/trustpanel.patch"
@@ -2121,7 +2210,6 @@ src_configure() {
 		mozconfig_add_options_ac 'no wasm-sandbox' --without-wasm-sandboxed-libraries
 		mozconfig_use_with system-harfbuzz system-graphite2
 	fi
-	! use jpegxl && mozconfig_add_options_ac '-jpegxl' --disable-jxl
 
 	if [[ ${use_lto} == "yes" ]] ; then
 		if use clang ; then
@@ -2250,6 +2338,11 @@ src_install() {
 		einfo "Installing RozeLynx system preferences..."
 		insinto "${PREFS_DIR}"
 		newins "${FILESDIR}/rozelynx/prefs/rozelynx-prefs.js" rozelynx-prefs.js
+	fi
+
+	if use pam-passkeys; then
+		einfo "Installing RozeLynx PAM passkey service (/etc/pam.d/rozelynx)..."
+		newpamd "${FILESDIR}/rozelynx/cpp/webauthn-pam/rozelynx.pam" rozelynx
 	fi
 
 	if use hwaccel ; then
@@ -2388,6 +2481,43 @@ with open('${policies_json}', 'w') as f:
 			# verification (signedState NOT_REQUIRED, no banners) is complete.
 		fi
 
+		# --- RozeLynx 2FA: the separate two-factor extension ---
+		# TOTP/HOTP vault (passphrase-encrypted), otpauth:// capture, page
+		# autofill. A whole extension of its own, not a features-module: it
+		# owns secrets and can be installed or removed independently.
+		if use twofa; then
+			einfo "Assembling RozeLynx 2FA extension..."
+			local tfa_src="${FILESDIR}/rozelynx/extension-2fa"
+			local tfa_dest="${T}/rozelynx-2fa-extension"
+			rm -rf "${tfa_dest}"
+			cp -a "${tfa_src}" "${tfa_dest}" || die
+			rm -f "${tfa_dest}/README.md"
+
+			(cd "${tfa_dest}" && zip -qr "${T}/rozelynx-2fa@bytewheel.org.xpi" .) \
+				|| die "failed to create the 2FA XPI"
+			local ext_install_dir="${MOZILLA_FIVE_HOME}/distribution/extensions"
+			insinto "${ext_install_dir}"
+			newins "${T}/rozelynx-2fa@bytewheel.org.xpi" "rozelynx-2fa@bytewheel.org.xpi"
+			einfo "Installed RozeLynx 2FA XPI to ${ext_install_dir}/"
+
+			local policies_json="${ED}${MOZILLA_FIVE_HOME}/distribution/policies.json"
+			if [[ -f "${policies_json}" ]]; then
+				einfo "Registering RozeLynx 2FA in policies.json..."
+				python3 -c "
+import json
+with open('${policies_json}') as f:
+    p = json.load(f)
+es = p['policies'].setdefault('ExtensionSettings', {})
+es['rozelynx-2fa@bytewheel.org'] = {
+    'installation_mode': 'force_installed',
+    'install_url': 'file://${MOZILLA_FIVE_HOME}/distribution/extensions/rozelynx-2fa@bytewheel.org.xpi'
+}
+with open('${policies_json}', 'w') as f:
+    json.dump(p, f, indent=4)
+" || ewarn "Failed to update policies.json for the 2FA extension"
+			fi
+		fi
+
 		# Install Lepton skin browser chrome CSS (reference file for userChrome.css)
 		if use lepton-skin; then
 			einfo "Installing Lepton skin CSS files..."
@@ -2523,8 +2653,39 @@ SSBEOF
 		insinto /usr/share/icons/hicolor/symbolic/apps
 		newins "${FILESDIR}/rozelynx/icon/rozelynx-symbolic.svg" rozelynx-symbolic.svg
 
-		insinto /usr/share/icons/hicolor/scalable/apps
-		newins "${FILESDIR}/rozelynx/icon/rozelynx.svg" rozelynx.svg
+		# The scalable theme icon (hicolor scalable/apps/rozelynx.svg) is
+		# what the Icon=rozelynx theme name resolves to - the .desktop's own
+		# icon, the notification badge fallback, and the PWA module's
+		# last-resort Icon= for a site whose own icon could not be
+		# materialised. Copying icon/rozelynx.svg (the old rose vector) there
+		# put the discontinued logo on every one of those surfaces, which is
+		# exactly the mismatch the PWA ladder exists to hide. So the scalable
+		# slot is GENERATED from branding/paw.png (the same mark the PNG
+		# ladder carries), base64-embedded the same way defaultFavicon.svg
+		# embeds favicon64: no committed base64 blob, re-droppable at any
+		# resolution, and the theme name and the PNG ladder can no longer
+		# disagree. icon/rozelynx.svg stays what the in-chrome rebranding
+		# sweep copies (a separate, still-open vector gap).
+		if [[ -f "${FILESDIR}/rozelynx/branding/paw.png" ]] \
+			&& command -v base64 >/dev/null 2>&1; then
+			local rozelynx_theme_b64
+			rozelynx_theme_b64="$(base64 -w0 "${FILESDIR}/rozelynx/branding/paw.png")"
+			cat > "${T}/rozelynx-theme.svg" <<-ROZELYNX_THEME_ICON || die "Failed to write the scalable theme icon"
+				<!-- RozeLynx: branding/paw.png embedded as the hicolor scalable theme icon.
+				     The PNG ladder under hicolor/<n>x<n>/apps/rozelynx.png carries the same
+				     artwork, so every Icon=rozelynx consumer and every size agree. -->
+				<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="474" height="474" viewBox="0 0 474 474">
+				  <image x="0" y="0" width="474" height="474" preserveAspectRatio="xMidYMid meet" xlink:href="data:image/png;base64,${rozelynx_theme_b64}"/>
+				</svg>
+			ROZELYNX_THEME_ICON
+			insinto /usr/share/icons/hicolor/scalable/apps
+			newins "${T}/rozelynx-theme.svg" rozelynx.svg
+			einfo "  scalable theme icon: branding/paw.png (replaces the old rose vector)"
+		else
+			ewarn "branding/paw.png absent; the scalable theme icon stays the old rose vector"
+			insinto /usr/share/icons/hicolor/scalable/apps
+			newins "${FILESDIR}/rozelynx/icon/rozelynx.svg" rozelynx.svg
+		fi
 
 		dosym /usr/share/icons/hicolor/scalable/apps/rozelynx.svg \
 			/usr/share/icons/hicolor/symbolic/apps/org.bytewheel.rozelynx-symbolic.svg
@@ -2570,6 +2731,14 @@ SSBEOF
 			-e "s:@EXEC@:${exec_command}:" \
 			-e "s:@ICON@:${icon_name}:" \
 			"${WORKDIR}/rozelynx.desktop-template" || die
+		# The OS half of the sync magic-link handoff: clicking a
+		# rozelynxsync:// link in any other app launches RozeLynx with it.
+		# Registered only when the scheme handler is compiled in (use sync).
+		if use sync; then
+			sed -i \
+				-e 's#^MimeType=\(.*\)$#MimeType=\1x-scheme-handler/rozelynxsync;#' \
+				"${WORKDIR}/rozelynx.desktop-template" || die
+		fi
 		newmenu "${WORKDIR}/rozelynx.desktop-template" "${desktop_filename}"
 		rm "${WORKDIR}/rozelynx.desktop-template" || die
 
@@ -2633,12 +2802,6 @@ SSBEOF
 			-i "${ED}/usr/share/dbus-1/services/org.mozilla.firefox.SearchProvider.service" || die
 		cat >>"${GENTOO_PREFS}" <<-EOF || die
 		pref("browser.gnome-search-provider.enabled", true);
-		EOF
-	fi
-
-	if use jpegxl ; then
-		cat >>"${GENTOO_PREFS}" <<-EOF || die
-		pref("image.jxl.enabled", true);
 		EOF
 	fi
 
@@ -2738,6 +2901,15 @@ pkg_postinst() {
 			elog "  scheme handler:        rozelynx-ext: (launcher: ${MOZILLA_FIVE_HOME}/open-external)"
 			elog "  activity log:          /tmp/rozelynx-open-external.log"
 		fi
+		if use pam-passkeys; then
+			elog "PAM passkeys (local platform authenticator) enabled!"
+			elog "  WebAuthn passkey prompts now offer this device next to USB security"
+			elog "  keys; user verification runs through PAM: face recognition via"
+				elog "  howdy when ${EROOT%/}/etc/pam.d/rozelynx or the system-auth chain"
+				elog "  carries pam_howdy.so, otherwise the account password prompt."
+				elog "  Disable at runtime: security.webauthn.rozelynx_pam.enabled"
+				elog "  USB/NFC security keys keep working in every case."
+		fi
 		elog ""
 		elog "Available USE flags for features:"
 		elog "  chrome-web-store   - Install extensions from Chrome Web Store"
@@ -2749,6 +2921,13 @@ pkg_postinst() {
 		elog "  pwa                - Progressive Web App support"
 		elog "  lepton-skin        - Compact Lepton UI theme"
 		elog "  ip-protection      - IP protection privacy overrides"
+		elog "  net-iface          - Per-tab network interface pinning"
+		elog "  pam-passkeys       - Local passkeys via PAM (howdy / password)"
+		elog "  download-handoff   - Hand downloads to an external manager"
+		elog "                      (Settings > General > Download hand-off)"
+		elog "  user-agent         - User agent switcher (global + per-URL rules)"
+		elog "  sync               - Magic-link state sync (rozelynxsync:)"
+		elog "  twofa              - RozeLynx 2FA extension (TOTP/HOTP vault)"
 		elog ""
 	fi
 
