@@ -154,12 +154,33 @@ for _src_dir in "$pkg_dir" "$gentoo_pkg_dir"; do
             [[ -n "$val" ]] && var_lines+=("${var}|${val}")
         done
 
+        # The llvm eclass generation is as upstream-version-sensitive as the
+        # vars above, and drifting behind ::gentoo breaks the whole package:
+        # rust.eclass (RUST_NEEDS_LLVM=1) inherits a specific llvm-rN, and
+        # two llvm generations cannot be sourced in one ebuild -- the first
+        # marks LLVM_REQUIRED_USE readonly, the second cannot assign it, so
+        # its pkg_setup is never defined and EXPORT_FUNCTIONS dies in the
+        # depend phase (exactly how the llvm-r1 template broke when
+        # rust.eclass moved to llvm-r2).  Grab the generation from the
+        # vanilla ebuild's inherit statement (which may span multiple lines)
+        # before the template overwrites it.
+        inherit_block=$(sed -n '/^inherit /,/[^\\]$/p' "$target")
+        llvm_eclass=$(grep -m1 -oE 'llvm-r[0-9]+' <<<"${inherit_block}" || true)
+
         cp "$template" "$target"
         for entry in "${var_lines[@]}"; do
             var="${entry%%|*}"
             val="${entry#*|}"
             sed -i "s|^${var}=.*|${val}|" "$target"
         done
+        # Swap the template's llvm generation for the vanilla one.  Only two
+        # spellings in the template carry the generation: the inherit token
+        # and the llvm-rN_pkg_setup call; the rest of the llvm API it uses
+        # (llvm_gen_dep, llvm_check_deps, LLVM_SLOT, LLVM_COMPAT) is shared
+        # by every generation.
+        if [[ -n "$llvm_eclass" ]]; then
+            sed -i "s/llvm-r[0-9]\+/${llvm_eclass}/g" "$target"
+        fi
         any_created=1
     done
 done
